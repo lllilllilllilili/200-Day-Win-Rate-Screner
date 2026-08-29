@@ -661,8 +661,8 @@ _KR_WINZONE = [
     ("293490.KQ", "카카오게임즈", {5: 50, 10: None, 15: None, 20: None}, "C"),
 ]
 _TYPE_LABEL = {
-    "A": "🅰️ 얕게(-5~10%가 스윗스팟)",
-    "B": "🅱️ 깊이(-15~20%가 최적)",
+    "A": "🅰️ 얕게(-5 ~ -10%가 스윗스팟)",
+    "B": "🅱️ 깊이(-15 ~ -20%가 최적)",
     "C": "🚫 비추(전략 안 맞음)",
 }
 
@@ -733,7 +733,7 @@ def render_kr_winzone():
         st.dataframe(df_all, use_container_width=True, hide_index=True)
 
     st.markdown(
-        "**타입 A** 얕게(-5~10%가 스윗스팟) · **타입 B** 깊이(-15~20%가 최적) · "
+        "**타입 A** 얕게(-5 ~ -10%가 스윗스팟) · **타입 B** 깊이(-15 ~ -20%가 최적) · "
         "**타입 C** 비추(SK하이닉스·카카오게임즈)  \n"
         "<span style='color:gray'>승률은 Yahoo Finance 전체 기간 전수조사 기반 내장 값입니다.</span>",
         unsafe_allow_html=True)
