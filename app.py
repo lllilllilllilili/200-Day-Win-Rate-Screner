@@ -632,6 +632,113 @@ def _ds_table(items):
     return pd.DataFrame(rows)
 
 
+# --- 국장 대형주 "200일선 아래 매수" 전략 승률 (전수조사 결과 내장) ---
+# 각 값: (티커, 이름, {-5, -10, -15, -20 구간별 승률%}, 타입)
+# 타입 A=얕게(-5~10 스윗스팟), B=깊이(-15~20 최적), C=비추
+_KR_WINZONE = [
+    ("012330.KS", "현대모비스", {5: 86, 10: 93, 15: 100, 20: 100}, "B"),
+    ("005930.KS", "삼성전자", {5: 90, 10: 90, 15: 92, 20: 86}, "A"),
+    ("003670.KS", "포스코퓨처엠", {5: 84, 10: 82, 15: 93, 20: 91}, "B"),
+    ("010130.KS", "고려아연", {5: 86, 10: 79, 15: 80, 20: 100}, "B"),
+    ("028260.KS", "삼성물산", {5: 80, 10: 82, 15: 100, 20: 100}, "B"),
+    ("030200.KS", "KT", {5: 84, 10: 94, 15: 90, 20: 80}, "A"),
+    ("017670.KS", "SK텔레콤", {5: 89, 10: 82, 15: 89, 20: 80}, "A"),
+    ("000270.KS", "기아", {5: 88, 10: 81, 15: 75, 20: 88}, "A"),
+    ("005380.KS", "현대차", {5: 78, 10: 70, 15: 79, 20: 90}, "B"),
+    ("006400.KS", "삼성SDI", {5: 83, 10: 82, 15: 87, 20: 83}, "A"),
+    ("051910.KS", "LG화학", {5: 77, 10: 80, 15: 88, 20: 83}, "B"),
+    ("112040.KQ", "위메이드", {5: 78, 10: 77, 15: 81, 20: 85}, "B"),
+    ("086520.KQ", "에코프로", {5: 88, 10: 83, 15: 76, 20: 69}, "A"),
+    ("247540.KQ", "에코프로비엠", {5: 92, 10: 86, 15: 80, 20: 67}, "A"),
+    ("000810.KS", "삼성화재", {5: 92, 10: 88, 15: None, 20: None}, "A"),
+    ("086790.KS", "하나금융", {5: 91, 10: 90, 15: None, 20: None}, "A"),
+    ("033780.KS", "KT&G", {5: 91, 10: 91, 15: None, 20: None}, "A"),
+    ("035420.KS", "네이버", {5: 83, 10: 69, 15: 62, 20: 50}, "A"),
+    ("035720.KS", "카카오", {5: 83, 10: None, 15: None, 20: None}, "A"),
+    ("015760.KS", "한국전력", {5: None, 10: None, 15: 79, 20: 100}, "B"),
+    ("196170.KQ", "알테오젠", {5: None, 10: None, 15: None, 20: 86}, "B"),
+    ("000660.KS", "SK하이닉스", {5: 5, 10: 3, 15: None, 20: None}, "C"),
+    ("293490.KQ", "카카오게임즈", {5: 50, 10: None, 15: None, 20: None}, "C"),
+]
+_TYPE_LABEL = {
+    "A": "🅰️ 얕게(-5~10%가 스윗스팟)",
+    "B": "🅱️ 깊이(-15~20%가 최적)",
+    "C": "🚫 비추(전략 안 맞음)",
+}
+
+
+def _nearest_zone(gap):
+    """현재 괴리율이 어느 매수 구간에 해당하는지. gap은 음수(아래)일 때만."""
+    if gap > -3:
+        return None  # 아직 매수 구간 아님 (200일선 근처/위)
+    for z in (20, 15, 10, 5):
+        if gap <= -z:
+            return z
+    return None
+
+
+def render_kr_winzone():
+    st.markdown("#### 🇰🇷 국장 대형주 200일선 매수 전략 스캐너")
+    st.caption("'200일선 아래 -N%에서 매수 → 200일선 복귀 시 매도' 전략. "
+               "현재 위치와 그 구간의 역사적 승률을 함께 봅니다.")
+
+    rows = []
+    for ticker, name, winrates, typ in _KR_WINZONE:
+        r = _ds_status(ticker)
+        if not r:
+            continue
+        gap = r["gap"]
+        zone = _nearest_zone(gap)
+        # 현재 구간 승률 (해당 구간 데이터 있으면)
+        if zone is not None and winrates.get(zone) is not None:
+            zone_str = f"-{zone}%"
+            wr = winrates[zone]
+            wr_str = f"{wr}%"
+            if wr >= 70:
+                status = "🟢 매수 구간 (승률 높음)"
+            elif wr >= 50:
+                status = "🟡 매수 구간 (보통)"
+            else:
+                status = "🔴 매수 구간 (승률 낮음/비추)"
+        elif gap > -3:
+            zone_str, wr_str, status = "-", "-", "200일선 위/근처 (대기)"
+        else:
+            zone_str, wr_str, status = f"~{gap:.0f}%", "-", "구간 데이터 없음"
+
+        rows.append({
+            "종목": name,
+            "타입": typ,
+            "현재 괴리율": f"{gap:+.1f}%",
+            "매수구간": zone_str,
+            "구간 승률": wr_str,
+            "상태": status,
+        })
+
+    if not rows:
+        st.warning("데이터를 불러오지 못했어요.")
+        return
+
+    # 매수 구간에 들어온 종목을 위로 정렬
+    df_all = pd.DataFrame(rows)
+    in_zone = df_all[df_all["매수구간"].str.startswith("-")]
+    others = df_all[~df_all["매수구간"].str.startswith("-")]
+
+    if len(in_zone) > 0:
+        st.success(f"🎯 지금 매수 구간에 들어온 종목: **{len(in_zone)}개**")
+        st.dataframe(in_zone, use_container_width=True, hide_index=True)
+    else:
+        st.info("현재 매수 구간(-5% 이하)에 들어온 종목이 없어요. 대부분 200일선 위입니다.")
+
+    with st.expander("전체 종목 보기 (매수 구간 아닌 것 포함)", expanded=False):
+        st.dataframe(df_all, use_container_width=True, hide_index=True)
+
+    st.markdown(
+        "**타입 A** 얕게(-5~10%가 스윗스팟) · **타입 B** 깊이(-15~20%가 최적) · "
+        "**타입 C** 비추(SK하이닉스·카카오게임즈)  \n"
+        "<span style='color:gray'>승률은 Yahoo Finance 전체 기간 전수조사 기반 내장 값입니다.</span>",
+        unsafe_allow_html=True)
+
+
 def render_daily_screener():
     st.subheader("📋 데일리 스캐너")
     st.caption("지수·미국 대형주·국장 대표주·알트코인의 200일선 상태와 돌파/이탈 신호를 한 번에.")
@@ -651,6 +758,11 @@ def render_daily_screener():
     with st.spinner("국장 대표주 스캔 중..."):
         st.markdown("#### 🇰🇷 국장 대표주")
         st.dataframe(_ds_table(list(_DS_KR.items())), use_container_width=True, hide_index=True)
+
+    with st.spinner("국장 200일선 매수 전략 스캔 중..."):
+        st.markdown("---")
+        render_kr_winzone()
+        st.markdown("---")
 
     with st.spinner("알트코인 스캔 중..."):
         st.markdown("#### 🪙 알트코인")
