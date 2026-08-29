@@ -879,9 +879,126 @@ _BABYTQQQ_PROFIT_STEPS = [
 ]
 
 
+# 로테이션 우선순위: TQQQ > BTC > SOXL (앞이 높은 우선순위)
+_ROTATION_ASSETS = [
+    {"ticker": "TQQQ", "name": "TQQQ", "buffer": 0.0, "prio": 1},
+    {"ticker": "BTC-USD", "name": "BTC (3%완충)", "buffer": 0.03, "prio": 2},
+    {"ticker": "SOXL", "name": "SOXL", "buffer": 0.0, "prio": 3},
+]
+
+# 백테스트 요약 (2015.07~2026.08, 초기 1000만+월 250만 적립) — 참고용 내장값
+_ROTATION_BACKTEST = [
+    {"전략": "갈아타기 (TQQQ>BTC>SOXL)", "배수": "15.2배", "CAGR": "+75.7%", "MDD": "-28.6%", "MAR": "2.65", "회복": "13개월"},
+    {"전략": "유지 (신호 무시)", "배수": "13.6배", "CAGR": "+73.9%", "MDD": "-33.0%", "MAR": "2.24", "회복": "17개월"},
+    {"전략": "TQQQ 단독", "배수": "7.6배", "CAGR": "+65.0%", "MDD": "-29.2%", "MAR": "2.23", "회복": "15개월"},
+    {"전략": "BTC 단독 (3%완충)", "배수": "7.5배", "CAGR": "+64.8%", "MDD": "-27.1%", "MAR": "2.39", "회복": "16개월"},
+    {"전략": "SOXL 단독", "배수": "11.4배", "CAGR": "+71.3%", "MDD": "-56.2%", "MAR": "1.27", "회복": "26개월"},
+]
+
+
+def _rotation_status(ticker, buffer):
+    """로테이션용: 200일선 상태 + 완충 적용 매도선 이탈 여부."""
+    raw = load_prices(ticker)
+    if raw.empty or len(raw) < 200:
+        return None
+    d = raw.copy()
+    d["SMA200"] = d["Close"].rolling(200).mean()
+    d = d.dropna()
+    if len(d) < 1:
+        return None
+    price = float(d["Close"].iloc[-1])
+    sma = float(d["SMA200"].iloc[-1])
+    gap = (price / sma - 1) * 100
+    sell_line = sma * (1 - buffer)  # 완충 적용 매도선
+    return {
+        "price": price, "sma": sma, "gap": gap,
+        "above": price > sma,
+        "holdable": price >= sell_line,  # 완충 감안 보유 유지 가능
+        "sell_line": sell_line,
+        "date": d.index[-1].strftime("%Y-%m-%d"),
+    }
+
+
+def render_rotation():
+    st.markdown("#### 🔄 로테이션 전략 (TQQQ > BTC > SOXL)")
+    st.caption("우선순위 높은 종목이 200일선 위면 그쪽으로 갈아탑니다. "
+               "TQQQ가 최우선, 없으면 BTC, 그것도 없으면 SOXL, 다 아래면 현금(SGOV).")
+
+    if not st.button("🔍 로테이션 현재 상태 확인", type="primary", key="rotation_scan"):
+        st.info("버튼을 눌러 3종목의 현재 200일선 상태와 '지금 어디 있어야 하는지'를 확인하세요.")
+    else:
+        with st.spinner("TQQQ · BTC · SOXL 상태 확인 중..."):
+            statuses = {}
+            for a in _ROTATION_ASSETS:
+                statuses[a["ticker"]] = _rotation_status(a["ticker"], a["buffer"])
+
+        if all(v is None for v in statuses.values()):
+            st.error("데이터를 불러오지 못했어요.")
+        else:
+            # 우선순위대로 '보유 가능(200일선 위/완충 내)'인 첫 종목 선택
+            target = None
+            for a in _ROTATION_ASSETS:
+                s = statuses.get(a["ticker"])
+                if s and s["holdable"]:
+                    target = a
+                    break
+
+            if target is None:
+                st.warning("⏸️ **전부 200일선 아래 → 현금(SGOV) 대피 구간**  \n"
+                           "→ 세 종목 모두 매도선 아래예요. SGOV에서 대기하세요.")
+            else:
+                s = statuses[target["ticker"]]
+                st.success(f"🎯 **지금 보유해야 할 종목: {target['name']}**  \n"
+                           f"→ 200일선 대비 {s['gap']:+.1f}%. 우선순위상 이 종목이 최상위 '보유 가능' 종목이에요.  \n"
+                           f"→ 더 높은 우선순위 종목(위 순서)이 200일선을 돌파하면 그쪽으로 갈아타세요.")
+
+            # 3종목 현황 테이블
+            rows = []
+            for a in _ROTATION_ASSETS:
+                s = statuses.get(a["ticker"])
+                if not s:
+                    rows.append({"우선순위": a["prio"], "종목": a["name"],
+                                 "현재가": "-", "200일선": "-", "괴리율": "-", "상태": "데이터 없음"})
+                    continue
+                if target and a["ticker"] == target["ticker"]:
+                    stt = "🟢 보유 (현재 타겟)"
+                elif s["holdable"]:
+                    stt = "🟡 보유 가능 (하위 우선순위)"
+                else:
+                    stt = "🔴 200일선 아래 (제외)"
+                rows.append({
+                    "우선순위": a["prio"], "종목": a["name"],
+                    "현재가": f"{s['price']:,.2f}", "200일선": f"{s['sma']:,.2f}",
+                    "괴리율": f"{s['gap']:+.1f}%", "상태": stt,
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            st.caption(f"기준일 {statuses.get('TQQQ', {}).get('date', '-') if statuses.get('TQQQ') else '-'} "
+                       "· BTC는 3% 완충 적용 (200일선 -3%까지 보유 유지)")
+
+    # 백테스트 요약 (참고용 내장값)
+    with st.expander("📊 백테스트 요약 (2015.07~2026.08, 참고용)", expanded=False):
+        st.dataframe(pd.DataFrame(_ROTATION_BACKTEST), use_container_width=True, hide_index=True)
+        st.markdown("""
+- **갈아타기**가 최강 (배수 15.2배, MAR 2.65). 하위 종목 보유 중 상위가 돌파하면 즉시 전환.
+- **TQQQ**가 리스크 대비 가장 효율적 (MAR·Sharpe 우수). **BTC(3%완충)**는 11년 전승. **SOXL**은 절대수익 1위지만 MDD -56%.
+- **% 손절 금지**: 레버리지 ETF에 -3% 손절 넣으면 수익이 1/4로 축소. 200일선 이탈만이 매도 신호.
+- **종가 기준만**: 장중 이탈로 판단하면 수익 1/16로 축소.
+- 200일선 아래로 내려가도 **55%가 1주 이내, 80%가 1개월 이내** 복귀.
+
+<span style='color:gray'>※ Yahoo Finance 기반, 수수료/세금/환율 미반영. 과거 성과가 미래를 보장하지 않습니다.</span>
+        """, unsafe_allow_html=True)
+
+
 def render_babytqqq():
     st.subheader("🍼 아기티큐 TQQQ 200일선 전략")
     st.caption("200일선 위=주식(TQQQ), 아래=채권(SGOV). 현재 상태와 다음 행동을 알려줍니다.")
+
+    mode = st.radio("전략 선택", ["단일 TQQQ", "로테이션 (TQQQ>BTC>SOXL)"],
+                    horizontal=True, key="baby_mode")
+    st.markdown("---")
+    if mode == "로테이션 (TQQQ>BTC>SOXL)":
+        render_rotation()
+        return
     st.markdown(
         "<span style='color:gray'>※ 커뮤니티에 공개된 'TQQQ 200일선 매매법'을 참고한 요약 도구입니다. "
         "투자 권유가 아니며 과거 성과가 미래를 보장하지 않습니다.</span>",
