@@ -865,16 +865,153 @@ def render_daily_screener():
     st.caption("⚠️ 과거 데이터 기반이며 투자 권유가 아닙니다. BUY/SELL은 200일선 돌파/이탈 신호일 뿐입니다.")
 
 
+# ============================================================
+# 추가 도구 4: 아기티큐 TQQQ 200일선 전략 대시보드
+# ============================================================
+# 부분 익절 단계: (수익률 임계 %, 매도 비율 설명)
+_BABYTQQQ_PROFIT_STEPS = [
+    (10, "보유 수량의 10% 익절 → SPYM 전환"),
+    (25, "보유 수량의 10% 익절 → SPYM 전환"),
+    (50, "보유 수량의 10% 익절 → SPYM 전환"),
+    (100, "남은 수량의 50% 익절 (대익절) → SPYM 전환"),
+    (200, "남은 수량의 50% 익절 (대익절) → SPYM 전환"),
+    (300, "남은 수량의 50% 익절 (대익절) · 이후 계속"),
+]
+
+
+def render_babytqqq():
+    st.subheader("🍼 아기티큐 TQQQ 200일선 전략")
+    st.caption("200일선 위=주식(TQQQ), 아래=채권(SGOV). 현재 상태와 다음 행동을 알려줍니다.")
+    st.markdown(
+        "<span style='color:gray'>※ 커뮤니티에 공개된 'TQQQ 200일선 매매법'을 참고한 요약 도구입니다. "
+        "투자 권유가 아니며 과거 성과가 미래를 보장하지 않습니다.</span>",
+        unsafe_allow_html=True)
+
+    if not st.button("🔍 TQQQ 현재 상태 확인", type="primary", key="baby_scan"):
+        st.info("버튼을 눌러 TQQQ의 현재 200일선 상태와 전략 신호를 확인하세요.")
+        _babytqqq_rules()
+        return
+
+    with st.spinner("TQQQ 데이터 로딩 중..."):
+        raw = load_prices("TQQQ")
+
+    if raw.empty or len(raw) < 200:
+        st.error("TQQQ 데이터를 불러오지 못했어요.")
+        _babytqqq_rules()
+        return
+
+    d = raw.copy()
+    d["SMA200"] = d["Close"].rolling(200).mean()
+    d = d.dropna()
+    price = float(d["Close"].iloc[-1])
+    sma = float(d["SMA200"].iloc[-1])
+    gap = (price / sma - 1) * 100
+    above = price > sma
+    pclose = float(d["Close"].iloc[-2])
+    pma = float(d["SMA200"].iloc[-2])
+    last_date = d.index[-1].strftime("%Y-%m-%d")
+
+    # 신호 판정
+    just_crossed_up = pclose <= pma and price > sma
+    just_crossed_down = pclose >= pma and price < sma
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("TQQQ 현재가", f"${price:,.2f}")
+    c2.metric("200일선", f"${sma:,.2f}")
+    c3.metric("200일선 대비", f"{gap:+.1f}%")
+
+    if just_crossed_up:
+        st.success("🟢 **매수 신호! (오늘 200일선 돌파)**  \n"
+                   "→ 오늘부터 3일에 걸쳐 1/3씩 분할 매수 시작. "
+                   "매수 도중 다시 200일선 아래로 내려가면 산 만큼만 즉시 매도하고 SGOV로 복귀.")
+    elif just_crossed_down:
+        st.error("🔴 **매도 신호! (오늘 200일선 이탈)**  \n"
+                 "→ 애프터장(한국시간 새벽 5~8시)에 TQQQ 전량 매도 후 SGOV로 대피. "
+                 "SPYM도 정리 대상.")
+    elif above:
+        st.info(f"✅ **보유 구간** — TQQQ가 200일선 위 (+{gap:.1f}%)에 있어요.  \n"
+                "→ 보유 유지. 별도 손절 라인 없음. 200일선 이탈 시에만 매도. "
+                "새 돈은 SPYM·SGOV 반반, 부분 익절은 아래 계산기 참고.")
+    else:
+        st.warning(f"⏸️ **대피 구간** — TQQQ가 200일선 아래 ({gap:.1f}%)에 있어요.  \n"
+                   "→ SGOV(채권)에서 대기. 200일선 위로 재돌파할 때까지 TQQQ 매수 안 함. "
+                   "새 돈은 SGOV만.")
+
+    st.caption(f"기준일 {last_date} · TQQQ 종가/200일선 기준")
+
+    # --- 부분 익절 계산기 ---
+    st.markdown("---")
+    st.markdown("#### 💰 부분 익절 목표 계산기")
+    st.caption("내 평균 단가를 넣으면 각 익절 단계의 목표가를 알려줘요.")
+    avg_price = st.number_input("내 TQQQ 평균 단가 ($)", min_value=0.0, value=float(round(price, 2)),
+                                step=1.0, key="baby_avg")
+    if avg_price > 0:
+        cur_ret = (price / avg_price - 1) * 100
+        st.markdown(f"현재 수익률: **{cur_ret:+.1f}%** (현재가 ${price:,.2f} / 평단 ${avg_price:,.2f})")
+        rows = []
+        next_target = None
+        for thr, desc in _BABYTQQQ_PROFIT_STEPS:
+            target_price = avg_price * (1 + thr / 100)
+            reached = cur_ret >= thr
+            if not reached and next_target is None:
+                next_target = (thr, target_price)
+            rows.append({
+                "익절 단계": f"+{thr}%",
+                "목표가": f"${target_price:,.2f}",
+                "도달 여부": "✅ 도달" if reached else "⏳ 대기",
+                "행동": desc,
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        if next_target:
+            thr, tp = next_target
+            need = (tp / price - 1) * 100
+            st.info(f"🎯 다음 익절 목표: **+{thr}%** = **${tp:,.2f}** "
+                    f"(현재가에서 {need:+.1f}% 더 오르면 도달)")
+        else:
+            st.success("🎉 모든 익절 단계를 이미 넘었어요. +300% 이후는 계속 대익절 규칙 적용.")
+
+    _babytqqq_rules()
+
+
+def _babytqqq_rules():
+    with st.expander("📖 전략 규칙 요약", expanded=False):
+        st.markdown("""
+**핵심 원칙**: 200일선 **위 = 주식(TQQQ)**, **아래 = 채권(SGOV)**
+
+**1. 매수 (200일선 돌파 시)**
+- 3일에 걸쳐 1/3씩 분할 매수 (휩쏘 대비)
+- 매수 도중 200일선 재이탈 시, 산 만큼만 즉시 매도 후 SGOV 복귀
+
+**2. 매도 (200일선 이탈 시)**
+- 이탈 당일 애프터장에 TQQQ 전량 매도 → SGOV 전환
+- 별도 손절 라인 없음. 200일선 이탈이 유일한 매도 신호
+
+**3. 새 돈이 생기면**
+- 200일선 위: SPYM · SGOV 반반 (소액은 SPYM만)
+- 200일선 아래: SGOV만
+
+**4. 부분 익절 (수익률 기준, 최초 돌파 시)**
+- 소익절: +10% / +25% / +50% → 각각 보유 수량의 10% 매도
+- 대익절: +100% / +200% / +300% → 각각 남은 수량의 50% 매도
+- 익절한 돈은 SPYM으로 전환 (한 방향: TQQQ → SPYM, 되돌리지 않음)
+- SPYM은 200일선 이탈 때까지 보유
+
+**5. 인출 순서**
+- SGOV 먼저 → SPYM → TQQQ (TQQQ는 마지막)
+        """)
+
+
 # ------------------------------------------------------------
 # UI
 # ------------------------------------------------------------
 st.title("📈 200일선 투자 도구 모음")
 
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "🎯 위치별 승률 스크리너",
     "🪙 크립토 200일선+MVRV",
     "🌡️ 시장 붕괴 경고",
     "📋 데일리 스캐너",
+    "🍼 아기티큐 TQQQ 전략",
 ])
 
 with tab2:
@@ -883,6 +1020,8 @@ with tab3:
     render_crash_scanner()
 with tab4:
     render_daily_screener()
+with tab5:
+    render_babytqqq()
 
 # ===== 탭 1: 기존 위치별 승률 스크리너 =====
 tab1.markdown("**종목 검색 → 200일선 대비 모든 위치 구간의 역사적 승률을 한눈에**")
