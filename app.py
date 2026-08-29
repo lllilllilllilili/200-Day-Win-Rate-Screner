@@ -126,7 +126,7 @@ st.markdown("""
 # ------------------------------------------------------------
 # 데이터 로딩
 # ------------------------------------------------------------
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=86400, show_spinner=False, max_entries=1)
 def load_krx_listing() -> pd.DataFrame:
     """한국 상장 종목 전체 목록(코드+이름). 실패 시 빈 DF."""
     try:
@@ -254,7 +254,7 @@ def resolve_korean_name(query: str):
     return ("none", [])
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False, max_entries=40)
 def load_prices(ticker: str) -> pd.DataFrame:
     ticker = ticker.strip()
     df = _load_yfinance(ticker)
@@ -282,6 +282,7 @@ def _load_yfinance(ticker: str):
         df = raw[["Close"]].copy()
         df.index = pd.to_datetime(df.index)
         df = df.sort_index().dropna()
+        df["Close"] = df["Close"].astype("float32")  # 메모리 절감
         return df
     except Exception:
         return None
@@ -300,6 +301,7 @@ def _load_fdr(ticker: str):
         df = raw[["Close"]].copy()
         df.index = pd.to_datetime(df.index)
         df = df.sort_index().dropna()
+        df["Close"] = df["Close"].astype("float32")  # 메모리 절감
         return df
     except Exception:
         return None
@@ -432,7 +434,7 @@ _MVRV_LABEL = {
 }
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False, max_entries=1)
 def _load_btc_mvrv():
     try:
         url = "https://bitcoin-data.com/v1/mvrv"
@@ -530,7 +532,7 @@ def _safe_dl(ticker, period="1y"):
         return None
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False, max_entries=1)
 def _crash_indicators():
     """시장 데이터 기반 지표들을 계산. (외부 매크로 지표는 프록시/근사)"""
     out = []
@@ -645,7 +647,7 @@ _DS_KR = {
 }
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False, max_entries=150)
 def _ds_status(ticker):
     """종가/200SMA/괴리/돌파신호 반환. (30분 캐시로 반복 다운로드 방지)"""
     data = _safe_dl(ticker, "2y")
@@ -672,7 +674,10 @@ def _ds_status(ticker):
 def _ds_table(items):
     rows = []
     for ticker, name in items:
-        r = _ds_status(ticker)
+        try:
+            r = _ds_status(ticker)
+        except Exception:
+            r = None  # 종목 하나가 실패해도 전체 스캔은 계속
         if not r:
             continue
         rows.append({
@@ -1423,6 +1428,15 @@ def _babytqqq_rules():
 # UI
 # ------------------------------------------------------------
 st.title("📈 200일선 투자 도구 모음")
+
+# --- 사이드바: 리소스 관리 ---
+with st.sidebar:
+    st.markdown("### ⚙️ 설정")
+    if st.button("🧹 캐시 비우기", help="앱이 느려지거나 리소스 경고가 뜨면 눌러 데이터 캐시를 초기화하세요."):
+        st.cache_data.clear()
+        st.success("캐시를 비웠어요. 다음 조회 시 최신 데이터를 다시 받아옵니다.")
+    st.caption("데이터는 자동으로 캐시(30분~1시간)되고, 오래된 항목은 자동 정리됩니다. "
+               "느려지면 위 버튼으로 캐시를 초기화하세요.")
 
 # 대분류 (1depth) → 각 안에 하위 탭 (2depth)
 group1, group2, group3, group4 = st.tabs([
