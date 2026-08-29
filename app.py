@@ -735,65 +735,94 @@ def _nearest_zone(gap):
     return None
 
 
+def _best_zone(winrates: dict):
+    """이 종목에서 승률이 가장 높은 매수 구간과 승률 반환. (zone, wr) 또는 None."""
+    valid = [(z, wr) for z, wr in winrates.items() if wr is not None]
+    if not valid:
+        return None
+    z, wr = max(valid, key=lambda x: x[1])
+    return z, wr
+
+
 def render_kr_winzone():
     st.markdown("#### 🇰🇷 국장 대형주 200일선 매수 전략 스캐너")
     st.caption("'200일선 아래 -N%에서 매수 → 200일선 복귀 시 매도' 전략. "
                "현재 위치와 그 구간의 역사적 승률을 함께 봅니다.")
 
-    rows = []
+    in_zone_rows = []   # 지금 매수 구간(-5% 이하)에 들어온 종목
+    above_rows = []     # 200일선 위/근처 (대기) 종목
     for ticker, name, winrates, typ in _KR_WINZONE:
         r = _ds_status(ticker)
         if not r:
             continue
         gap = r["gap"]
         zone = _nearest_zone(gap)
-        # 현재 구간 승률 (해당 구간 데이터 있으면)
+
+        # 이 종목의 최고 승률 구간 (내려오면 어디가 제일 좋은지)
+        best = _best_zone(winrates)
+        best_str = f"-{best[0]}% ({best[1]}%)" if best else "-"
+        pos = "위" if gap >= 0 else "아래"
+
+        # 현재 매수 구간에 들어와 있고 그 구간 승률 데이터가 있으면 → 매수 구간 종목
         if zone is not None and winrates.get(zone) is not None:
-            zone_str = f"-{zone}%"
             wr = winrates[zone]
-            wr_str = f"{wr}%"
             if wr >= 70:
                 status = "🟢 매수 구간 (승률 높음)"
             elif wr >= 50:
                 status = "🟡 매수 구간 (보통)"
             else:
                 status = "🔴 매수 구간 (승률 낮음/비추)"
-        elif gap > -3:
-            zone_str, wr_str, status = "-", "-", "200일선 위/근처 (대기)"
+            in_zone_rows.append({
+                "종목": name, "타입": typ,
+                "현재 괴리율": f"{gap:+.1f}%",
+                "현재 매수구간": f"-{zone}%",
+                "구간 승률": f"{wr}%",
+                "최고 승률 구간": best_str,
+                "상태": status,
+            })
         else:
-            zone_str, wr_str, status = f"~{gap:.0f}%", "-", "구간 데이터 없음"
+            # 200일선 위이거나, 아래지만 그 구간 데이터가 없는 경우 → 대기 목록
+            if gap >= 0:
+                status = f"🔵 200일선 위 (+{gap:.1f}%) · 대기"
+            elif gap > -5:
+                status = f"⚪ 200일선 바로 아래 ({gap:.1f}%) · 매수 임박"
+            else:
+                status = f"⚫ 200일선 아래 ({gap:.1f}%) · 구간 데이터 없음"
+            above_rows.append({
+                "종목": name, "타입": typ,
+                "현재 괴리율": f"{gap:+.1f}%",
+                "현재 위치": f"200일선 {pos}",
+                "최고 승률 구간": best_str,
+                "상태": status,
+            })
 
-        rows.append({
-            "종목": name,
-            "타입": typ,
-            "현재 괴리율": f"{gap:+.1f}%",
-            "매수구간": zone_str,
-            "구간 승률": wr_str,
-            "상태": status,
-        })
-
-    if not rows:
+    if not in_zone_rows and not above_rows:
         st.warning("데이터를 불러오지 못했어요.")
         return
 
-    # 매수 구간에 들어온 종목을 위로 정렬
-    df_all = pd.DataFrame(rows)
-    in_zone = df_all[df_all["매수구간"].str.startswith("-")]
-    others = df_all[~df_all["매수구간"].str.startswith("-")]
-
-    if len(in_zone) > 0:
-        st.success(f"🎯 지금 매수 구간에 들어온 종목: **{len(in_zone)}개**")
-        st.dataframe(in_zone, use_container_width=True, hide_index=True)
+    # 1) 지금 매수 구간 종목
+    if in_zone_rows:
+        st.success(f"🎯 지금 매수 구간(-5% 이하)에 들어온 종목: **{len(in_zone_rows)}개**")
+        st.dataframe(pd.DataFrame(in_zone_rows), use_container_width=True, hide_index=True)
     else:
-        st.info("현재 매수 구간(-5% 이하)에 들어온 종목이 없어요. 대부분 200일선 위입니다.")
+        st.info("현재 매수 구간(-5% 이하)에 들어온 종목이 없어요. 아래는 200일선 위 대기 종목입니다.")
 
-    with st.expander("전체 종목 보기 (매수 구간 아닌 것 포함)", expanded=False):
-        st.dataframe(df_all, use_container_width=True, hide_index=True)
+    # 2) 200일선 위/대기 종목 (숨기지 않고 항상 표시)
+    if above_rows:
+        st.markdown("**📈 200일선 위 / 대기 종목** — 지금은 매수 구간 아님. "
+                    "'최고 승률 구간'은 이 종목이 그만큼 내려왔을 때 역사적으로 가장 승률이 높았던 지점이에요.")
+        # 괴리율 낮은(200일선에 가까운/아래) 순으로 정렬해서 매수 임박 종목이 위로
+        above_df = pd.DataFrame(above_rows)
+        above_df["_sort"] = above_df["현재 괴리율"].str.rstrip("%").astype(float)
+        above_df = above_df.sort_values("_sort").drop(columns="_sort")
+        st.dataframe(above_df, use_container_width=True, hide_index=True)
 
     st.markdown(
         "**타입 A** 얕게(-5 ~ -10%가 스윗스팟) · **타입 B** 깊이(-15 ~ -20%가 최적) · "
         "**타입 C** 비추(SK하이닉스·카카오게임즈)  \n"
-        "<span style='color:gray'>승률은 Yahoo Finance 전체 기간 전수조사 기반 내장 값입니다.</span>",
+        "<span style='color:gray'>· '최고 승률 구간'은 그 종목이 200일선 아래 해당 지점까지 내려왔을 때 "
+        "역사적으로 가장 높았던 매수 승률입니다 (Yahoo Finance 전체 기간 전수조사 내장값). "
+        "200일선 위 매수의 승률이 아니라, '내려오면 여기가 기회'라는 참고 지표예요.</span>",
         unsafe_allow_html=True)
 
 
