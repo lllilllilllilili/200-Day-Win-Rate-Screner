@@ -343,78 +343,65 @@ def zone_analysis(df: pd.DataFrame, band_width: float, step: float,
     n = len(close)
     half = band_width / 2
 
-    # 0%를 중심으로 step 간격의 중심점들 생성 (대칭)
+    # --- 1단계: 각 진입 시점(pos)의 결과를 딱 한 번만 계산 ---
+    # (target/stop/max_hold 가 고정이면 결과는 gap 과 무관하므로, 구간별로 재계산할 필요 없음.
+    #  슬라이딩 구간이 겹쳐 같은 pos 가 여러 구간에 들어가도 계산은 1회만 하고 인덱싱으로 집계.)
+    exit_ret = np.full(n, np.nan)   # 청산 수익률(%)
+    max_ret = np.full(n, np.nan)    # 보유 중 최대 도달 수익률(%)
+    hold_day = np.zeros(n, dtype=np.int32)
+    win = np.zeros(n, dtype=bool)
+
+    for pos in range(n - 1):
+        entry = close[pos]
+        end = min(pos + max_hold, n - 1)
+        path = close[pos + 1:end + 1]
+        if path.size == 0:
+            continue
+        cum = (path / entry - 1.0) * 100.0
+        max_ret[pos] = cum.max()
+
+        hit_t = np.argmax(cum >= target_pct) if (cum >= target_pct).any() else -1
+        hit_s = np.argmax(cum <= -stop_pct) if (cum <= -stop_pct).any() else -1
+
+        if hit_t != -1 and (hit_s == -1 or hit_t <= hit_s):
+            win[pos] = True
+            exit_ret[pos] = target_pct
+            hold_day[pos] = hit_t + 1
+        elif hit_s != -1:
+            exit_ret[pos] = -stop_pct
+            hold_day[pos] = hit_s + 1
+        else:
+            final = cum[-1]
+            win[pos] = final > 0
+            exit_ret[pos] = final
+            hold_day[pos] = path.size
+
+    valid = ~np.isnan(exit_ret)  # 결과가 있는 진입 시점
+
+    # --- 2단계: 슬라이딩 구간별로 인덱싱 집계 ---
     n_neg = int(np.floor((0 - zone_min) / step))
     n_pos = int(np.floor((zone_max - 0) / step))
     centers = [round(-k * step, 6) for k in range(n_neg, 0, -1)] + \
               [round(k * step, 6) for k in range(0, n_pos + 1)]
 
-    rows = []
-
     def fmt(v):
         return f"{v:+.0f}" if abs(v - round(v)) < 1e-9 else f"{v:+.1f}"
 
+    rows = []
     for center in centers:
         lo, hi = center - half, center + half
-        zone_label = f"{fmt(lo)}%~{fmt(hi)}%"
-        mask = (gap >= lo) & (gap < hi)
-        positions = np.where(mask)[0]
-
-        exit_returns = []   # 청산 시 실제 수익률(%)
-        max_rets = []       # 보유 중 최대 도달 수익률(%)
-        hold_days = []      # 청산까지 걸린 거래일수
-        wins = 0
-
-        for pos in positions:
-            if pos >= n - 1:
-                continue
-            entry = close[pos]
-            end = min(pos + max_hold, n - 1)
-            path = close[pos + 1:end + 1]
-            if len(path) == 0:
-                continue
-
-            cum = (path / entry - 1) * 100  # 진입 이후 일별 수익률
-            max_rets.append(float(cum.max()))
-
-            hit_target = np.where(cum >= target_pct)[0]
-            hit_stop = np.where(cum <= -stop_pct)[0]
-            t_day = hit_target[0] if len(hit_target) else None
-            s_day = hit_stop[0] if len(hit_stop) else None
-
-            if t_day is not None and (s_day is None or t_day <= s_day):
-                # 목표 먼저 (동시 캔들이면 목표 우선 처리)
-                wins += 1
-                exit_returns.append(target_pct)
-                hold_days.append(int(t_day) + 1)
-            elif s_day is not None:
-                # 손절 먼저
-                exit_returns.append(-stop_pct)
-                hold_days.append(int(s_day) + 1)
-            else:
-                # 만기까지 미달 -> 만기 수익률 부호로 판정
-                final = float(cum[-1])
-                if final > 0:
-                    wins += 1
-                exit_returns.append(final)
-                hold_days.append(len(path))
-
-        trades = len(exit_returns)
+        sel = valid & (gap >= lo) & (gap < hi)
+        trades = int(sel.sum())
         if trades == 0:
             continue
-
-        exit_returns = np.array(exit_returns)
-        max_rets = np.array(max_rets)
-        hold_days = np.array(hold_days)
-
         rows.append({
             "center": center,
-            "zone_label": zone_label,
+            "zone_label": f"{fmt(lo)}%~{fmt(hi)}%",
             "trades": trades,
-            "win_rate": float(wins / trades * 100),
-            "avg_return": float(exit_returns.mean()),
-            "max_return": float(max_rets.mean()),
-            "avg_holding_days": int(round(hold_days.mean())),
+            "win_rate": float(win[sel].mean() * 100),
+            "avg_return": float(exit_ret[sel].mean()),
+            "max_return": float(np.nanmean(max_ret[sel])),
+            "avg_holding_days": int(round(hold_day[sel].mean())),
         })
 
     return pd.DataFrame(rows)
@@ -658,8 +645,9 @@ _DS_KR = {
 }
 
 
+@st.cache_data(ttl=1800, show_spinner=False)
 def _ds_status(ticker):
-    """종가/200SMA/괴리/돌파신호 반환."""
+    """종가/200SMA/괴리/돌파신호 반환. (30분 캐시로 반복 다운로드 방지)"""
     data = _safe_dl(ticker, "2y")
     if data is None or len(data) < 201:
         return None
@@ -1436,28 +1424,38 @@ def _babytqqq_rules():
 # ------------------------------------------------------------
 st.title("📈 200일선 투자 도구 모음")
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
-    "🎯 위치별 승률 스크리너",
-    "🪙 크립토 200일선+MVRV",
-    "🌡️ 시장 붕괴 경고",
-    "📋 데일리 스캐너",
-    "🍼 아기티큐 TQQQ 전략",
-    "🔄 200일선 복귀 기간",
-    "🗓️ 섹터 순환매",
+# 대분류 (1depth) → 각 안에 하위 탭 (2depth)
+group1, group2, group3, group4 = st.tabs([
+    "🔍 종목 분석",
+    "📊 시장 스캔",
+    "📈 전략",
+    "📚 통계·참고",
 ])
 
-with tab2:
-    render_crypto_screener()
-with tab3:
-    render_crash_scanner()
-with tab4:
-    render_daily_screener()
-with tab5:
-    render_babytqqq()
-with tab6:
-    render_recovery()
-with tab7:
-    render_sector_rotation()
+with group1:
+    sub = st.tabs(["🎯 위치별 승률 스크리너", "🪙 크립토 200일선+MVRV"])
+    tab1 = sub[0]
+    with sub[1]:
+        render_crypto_screener()
+
+with group2:
+    sub = st.tabs(["📋 데일리 스캐너", "🌡️ 시장 붕괴 경고"])
+    with sub[0]:
+        render_daily_screener()
+    with sub[1]:
+        render_crash_scanner()
+
+with group3:
+    sub = st.tabs(["🍼 아기티큐 TQQQ 전략"])
+    with sub[0]:
+        render_babytqqq()
+
+with group4:
+    sub = st.tabs(["🔄 200일선 복귀 기간", "🗓️ 섹터 순환매"])
+    with sub[0]:
+        render_recovery()
+    with sub[1]:
+        render_sector_rotation()
 
 # ===== 탭 1: 기존 위치별 승률 스크리너 =====
 tab1.markdown("**종목 검색 → 200일선 대비 모든 위치 구간의 역사적 승률을 한눈에**")
@@ -1504,7 +1502,7 @@ with tab1:
                                    help="이 손실률에 먼저 닿으면 패배(손절)")
     with c3:
         max_hold_choice = st.selectbox("최대 보유기간", ["3개월(63일)", "6개월(126일)", "12개월(252일)", "24개월(504일)"],
-                                       index=2,
+                                       index=0,
                                        help="이 기간까지 목표·손절 둘 다 안 닿으면 만기 청산")
 
     max_hold = {"3개월(63일)": 63, "6개월(126일)": 126, "12개월(252일)": 252, "24개월(504일)": 504}[max_hold_choice]
