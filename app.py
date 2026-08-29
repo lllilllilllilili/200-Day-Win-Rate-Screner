@@ -824,6 +824,92 @@ def render_kr_winzone():
         unsafe_allow_html=True)
 
 
+def render_us_winzone():
+    st.markdown("#### 🇺🇸 미국 대형주 200일선 매수 전략 스캐너")
+    st.caption("'200일선 아래로 내려오면 매수 → 복귀 시 매도' 전략. "
+               "복귀 빠른 TOP50 종목의 현재 위치와 역사적 복귀 기간을 함께 봅니다.")
+
+    # 복귀 빠른 순(평균 복귀일)으로 정렬, 중복 티커 제거
+    seen = set()
+    assets = []
+    for tk, name, cyc, avg, med, mx in _RECOVERY_TOP50:
+        if tk in seen:
+            continue
+        seen.add(tk)
+        assets.append((tk, name, avg, med, mx))
+    assets.sort(key=lambda x: x[2])  # 평균 복귀일 오름차순
+
+    below_rows = []   # 지금 200일선 아래 (매수 기회)
+    above_rows = []   # 200일선 위 (대기)
+    for tk, name, avg, med, mx in assets:
+        r = _ds_status(tk)
+        if not r:
+            continue
+        gap = r["gap"]
+        recov = f"평균 {avg}일 / 중앙값 {med}일"
+        # 복귀 기간 기반 대응 가이드
+        if med <= 4:
+            guide = "복귀 매우 빠름 → 내려오면 바로 매수"
+        elif med <= 6:
+            guide = "복귀 빠름 → 신속 분할 매수"
+        else:
+            guide = "복귀 다소 느림 → 여유 분할 매수"
+
+        if gap < 0:
+            # 200일선 아래 = 매수 기회
+            if gap <= -10:
+                status = "🟢 깊은 매수 구간 (-10% 이하)"
+            elif gap <= -5:
+                status = "🟢 매수 구간 (-5% 이하)"
+            else:
+                status = "⚪ 200일선 바로 아래 · 매수 임박"
+            below_rows.append({
+                "종목": name,
+                "현재 괴리율": f"{gap:+.1f}%",
+                "복귀 기간": recov,
+                "최악(최대)": f"{mx}일",
+                "대응": guide,
+                "상태": status,
+            })
+        else:
+            above_rows.append({
+                "종목": name,
+                "현재 괴리율": f"{gap:+.1f}%",
+                "복귀 기간": recov,
+                "상태": f"🔵 200일선 위 (+{gap:.1f}%) · 대기",
+            })
+
+    if not below_rows and not above_rows:
+        st.warning("데이터를 불러오지 못했어요.")
+        return
+
+    # 1) 지금 200일선 아래 (매수 기회) — 깊이 빠진 순으로
+    if below_rows:
+        st.success(f"🎯 지금 200일선 아래로 내려온 종목: **{len(below_rows)}개** (매수 기회)")
+        below_df = pd.DataFrame(below_rows)
+        below_df["_sort"] = below_df["현재 괴리율"].str.rstrip("%").astype(float)
+        below_df = below_df.sort_values("_sort").drop(columns="_sort")
+        st.dataframe(below_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("현재 200일선 아래로 내려온 종목이 없어요. 대부분 200일선 위입니다.")
+
+    # 2) 200일선 위 (대기) — 200일선에 가까운 순으로
+    if above_rows:
+        st.markdown("**📈 200일선 위 / 대기 종목** — 지금은 매수 구간 아님. "
+                    "'복귀 기간'은 이 종목이 200일선 아래로 내려갔을 때 역사적으로 며칠 만에 복귀했는지예요.")
+        above_df = pd.DataFrame(above_rows)
+        above_df["_sort"] = above_df["현재 괴리율"].str.rstrip("%").astype(float)
+        above_df = above_df.sort_values("_sort").drop(columns="_sort")
+        st.dataframe(above_df, use_container_width=True, hide_index=True)
+
+    st.markdown(
+        "<span style='color:gray'>· 복귀 빠른 순(평균 복귀일)으로 정렬. "
+        "복귀가 빠른 종목일수록 200일선 아래에서 모을 시간이 짧으니 '내려오자마자' 사야 하고, "
+        "느린 종목은 여유 있게 분할 매수할 수 있어요. "
+        "복귀 기간은 미국 시총 TOP50 전수 분석 내장값입니다 (Yahoo Finance 전체 기간).</span>",
+        unsafe_allow_html=True)
+
+
 def render_favorites_section():
     """즐겨찾기한 종목들의 현재 200일선 상태 표시."""
     favs = get_favorites()
@@ -1161,6 +1247,10 @@ def render_daily_screener():
     with st.spinner("국장 200일선 매수 전략 스캔 중..."):
         st.markdown("---")
         render_kr_winzone()
+
+    with st.spinner("미국 대형주 200일선 매수 전략 스캔 중..."):
+        st.markdown("---")
+        render_us_winzone()
         st.markdown("---")
 
     with st.spinner("알트코인 스캔 중..."):
