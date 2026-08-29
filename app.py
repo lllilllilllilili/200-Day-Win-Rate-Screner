@@ -18,68 +18,47 @@ from datetime import datetime
 st.set_page_config(page_title="200일선 승률 스크리너", page_icon="📈", layout="wide")
 
 # ------------------------------------------------------------
-# 즐겨찾기 (브라우저 localStorage 저장, 폰에서 계속 유지)
+# 즐겨찾기 (URL 쿼리 파라미터에 저장 — 북마크/홈화면 추가로 유지)
 # ------------------------------------------------------------
-_FAV_KEY = "winrate_favorites"
-_FAV_STATE = "_fav_cache"        # session_state 캐시 키
-_FAV_LOADED = "_fav_loaded"      # localStorage에서 한 번 읽었는지 플래그
-
-try:
-    from streamlit_local_storage import LocalStorage
-    _local_storage = LocalStorage()
-    _LS_AVAILABLE = True
-except Exception:
-    _local_storage = None
-    _LS_AVAILABLE = False
-
-
-def _parse_favs(raw):
-    import json as _j
-    if not raw:
-        return []
-    try:
-        data = _j.loads(raw) if isinstance(raw, str) else raw
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
-
-
-def _load_favs_once():
-    """앱 실행 시 localStorage에서 즐겨찾기를 한 번 읽어 session_state에 캐시."""
-    if _FAV_STATE in st.session_state and st.session_state.get(_FAV_LOADED):
-        return
-    if not _LS_AVAILABLE:
-        st.session_state.setdefault(_FAV_STATE, [])
-        st.session_state[_FAV_LOADED] = True
-        return
-    try:
-        raw = _local_storage.getItem(_FAV_KEY)
-        st.session_state[_FAV_STATE] = _parse_favs(raw)
-        # getItem은 비동기라 첫 호출에 None이 올 수 있음. 값이 오면 loaded 처리.
-        if raw is not None:
-            st.session_state[_FAV_LOADED] = True
-    except Exception:
-        st.session_state.setdefault(_FAV_STATE, [])
-        st.session_state[_FAV_LOADED] = True
+# URL 형식: ?fav=TQQQ|TQQQ,005930.KS|삼성전자
+#   각 항목은 "티커|이름", 항목 구분은 콤마.
+_FAV_PARAM = "fav"
 
 
 def get_favorites() -> list:
-    """현재 즐겨찾기 목록 (session_state 캐시 기준)."""
-    _load_favs_once()
-    return st.session_state.get(_FAV_STATE, [])
+    """URL 쿼리 파라미터에서 즐겨찾기 목록 [{'ticker','name'}, ...] 읽기."""
+    try:
+        raw = st.query_params.get(_FAV_PARAM, "")
+    except Exception:
+        raw = ""
+    if not raw:
+        return []
+    favs = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "|" in item:
+            ticker, name = item.split("|", 1)
+        else:
+            ticker, name = item, item
+        ticker = ticker.strip()
+        name = name.strip() or ticker
+        if ticker and not any(f["ticker"] == ticker for f in favs):
+            favs.append({"ticker": ticker, "name": name})
+    return favs
 
 
 def _persist_favs(favs: list):
-    """session_state 갱신 + localStorage에 영구 저장 (고유 key로 컴포넌트 충돌 방지)."""
-    import json as _j
-    import time as _time
-    st.session_state[_FAV_STATE] = favs
-    if not _LS_AVAILABLE:
-        return
+    """즐겨찾기를 URL 쿼리 파라미터에 기록."""
     try:
-        # 매 저장마다 고유 key -> 컴포넌트 충돌/캐시 문제 방지
-        uniq = f"set_fav_{int(_time.time() * 1000)}"
-        _local_storage.setItem(_FAV_KEY, _j.dumps(favs, ensure_ascii=False), key=uniq)
+        if favs:
+            encoded = ",".join(f"{f['ticker']}|{f['name']}" for f in favs)
+            st.query_params[_FAV_PARAM] = encoded
+        else:
+            # 비면 파라미터 제거
+            if _FAV_PARAM in st.query_params:
+                del st.query_params[_FAV_PARAM]
     except Exception:
         pass
 
@@ -875,7 +854,19 @@ def render_favorites_section():
             "신호": r["signal"],
         })
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-    st.caption(f"총 {len(favs)}개 즐겨찾기 · 브라우저에 저장되어 이 기기에서 계속 유지됩니다.")
+
+    # 개별 삭제
+    del_target = st.selectbox("삭제할 즐겨찾기", ["(선택)"] + [f["name"] for f in favs],
+                              key="fav_del_select")
+    if del_target != "(선택)":
+        if st.button(f"🗑️ '{del_target}' 삭제", key="fav_del_btn"):
+            tk = next((f["ticker"] for f in favs if f["name"] == del_target), None)
+            if tk:
+                remove_favorite(tk)
+                st.rerun()
+
+    st.caption(f"총 {len(favs)}개 즐겨찾기 · **URL에 저장**됩니다. "
+               "이 페이지를 **북마크하거나 폰 홈화면에 추가**하면 다음에도 그대로 유지돼요.")
 
 
 # ============================================================
@@ -934,6 +925,153 @@ def _recovery_action(median_days):
         return "복귀 빠름 → 신속 분할 매수"
     else:
         return "복귀 다소 느림 → 여유 있게 분할 매수 가능"
+
+
+# ============================================================
+# 추가 도구 6: 미국 섹터 순환매 (1999~2026 계절성 내장값)
+# ============================================================
+_SECTOR_ETFS = {
+    "XLK": "기술(IT)", "XLF": "금융", "XLE": "에너지", "XLV": "헬스케어",
+    "XLY": "경기소비재", "XLP": "필수소비재", "XLI": "산업재", "XLB": "소재",
+    "XLU": "유틸리티", "XLRE": "부동산", "XLC": "커뮤니케이션",
+}
+
+# 월별 (최강섹터, 수익률, 최약섹터, 수익률)
+_MONTH_BEST_WORST = {
+    1:  ("커뮤니케이션", "+4.2%", "소재", "-0.8%"),
+    2:  ("에너지", "+1.6%", "유틸리티", "-1.0%"),
+    3:  ("유틸리티", "+2.3%", "커뮤니케이션", "-0.8%"),
+    4:  ("에너지", "+3.2%", "부동산", "+1.0%"),
+    5:  ("커뮤니케이션", "+2.6%", "소재", "+0.2%"),
+    6:  ("부동산", "+1.8%", "금융", "-0.8%"),
+    7:  ("부동산", "+3.2%", "에너지", "+0.5%"),
+    8:  ("커뮤니케이션", "+1.7%", "에너지", "-0.5%"),
+    9:  ("유틸리티", "+0.1%", "부동산", "-3.0%"),
+    10: ("기술(IT)", "+2.9%", "부동산", "-0.9%"),
+    11: ("소재", "+3.6%", "유틸리티", "+0.8%"),
+    12: ("소재", "+1.7%", "커뮤니케이션", "0%"),
+}
+
+# 월별 TOP3 + 꼴찌
+_MONTH_TOP3 = {
+    1:  ("커뮤니케이션", "에너지", "헬스케어", "소재"),
+    2:  ("에너지", "소재", "산업재", "유틸리티"),
+    3:  ("유틸리티", "에너지", "소재", "커뮤니케이션"),
+    4:  ("에너지", "소재", "산업재", "부동산"),
+    5:  ("커뮤니케이션", "기술(IT)", "유틸리티", "소재"),
+    6:  ("부동산", "기술(IT)", "헬스케어", "금융"),
+    7:  ("부동산", "커뮤니케이션", "금융", "에너지"),
+    8:  ("커뮤니케이션", "기술(IT)", "부동산", "에너지"),
+    9:  ("유틸리티", "필수소비재", "경기소비재", "부동산"),
+    10: ("기술(IT)", "금융", "소재", "부동산"),
+    11: ("소재", "커뮤니케이션", "산업재", "유틸리티"),
+    12: ("소재", "헬스케어", "산업재", "커뮤니케이션"),
+}
+
+# 실전 순환매 액션 (매수 타이밍)
+_SECTOR_ACTION = {
+    1:  "커뮤니케이션(XLC) 보유 · 1월은 커뮤니케이션 +4.2%로 전 섹터/월 단일 최고",
+    2:  "에너지(XLE)로 전환 · 봄 강세 시작. 유틸리티 축소",
+    3:  "유틸리티·에너지 강세 · 봄 전력수요+드라이빙 시즌 기대",
+    4:  "소재(XLB)·산업재(XLI) 매수 · 건설 착공/제조 가동. 에너지도 강세",
+    5:  "커뮤니케이션·기술(IT) · 여름 앞두고 성장주",
+    6:  "부동산(XLRE) 매수 · 6~7월 승률 91%로 전 섹터 최고",
+    7:  "부동산 유지 · 주택 매매 성수기 지속",
+    8:  "유틸리티(XLU)로 방어 전환 준비 · 9월 대비",
+    9:  "유틸리티(XLU)만 · 9월은 유틸리티만 유일하게 플러스, 나머지 전부 약세",
+    10: "기술(XLK) 매수 · 아이폰 출시+3분기 실적. 10월 말 소재·산업재도 담기",
+    11: "전 섹터 강세월 · 소재(XLB) +3.6%(승률 81%) 최강. 아무거나 사도 3번 중 2번 수익",
+    12: "소재·헬스케어·산업재 · 산타랠리. 커뮤니케이션은 이달 약세",
+}
+
+# 11월 전 섹터 강세 (수익률, 승률)
+_NOV_STRENGTH = [
+    ("소재", "+3.6%", "81%"), ("커뮤니케이션", "+3.5%", "75%"),
+    ("산업재", "+3.5%", "78%"), ("부동산", "+3.1%", "64%"),
+    ("경기소비재", "+2.9%", "78%"), ("기술(IT)", "+2.7%", "74%"),
+    ("헬스케어", "+2.4%", "78%"), ("필수소비재", "+2.0%", "74%"),
+    ("금융", "+2.0%", "67%"), ("에너지", "+1.8%", "59%"),
+    ("유틸리티", "+0.8%", "59%"),
+]
+
+_MONTH_NAMES = {1:"1월",2:"2월",3:"3월",4:"4월",5:"5월",6:"6월",
+                7:"7월",8:"8월",9:"9월",10:"10월",11:"11월",12:"12월"}
+
+
+def render_sector_rotation():
+    st.subheader("🗓️ 미국 섹터 순환매")
+    st.caption("11개 미국 섹터 ETF의 월별 계절성 (1999~2026, 약 27년). 몇 월에 어떤 섹터가 강한지.")
+
+    from datetime import datetime as _dt
+    cur_month = _dt.now().month
+    mname = _MONTH_NAMES[cur_month]
+
+    # 이번 달 추천
+    best, best_ret, worst, worst_ret = _MONTH_BEST_WORST[cur_month]
+    top3 = _MONTH_TOP3[cur_month]
+    st.success(f"### 📌 이번 달({mname}) 순환매\n"
+               f"**최강 섹터: {best} ({best_ret})** · 최약: {worst} ({worst_ret})  \n"
+               f"TOP3: {top3[0]} → {top3[1]} → {top3[2]} · 꼴찌: {top3[3]}")
+    st.info(f"💡 **{mname} 액션**: {_SECTOR_ACTION[cur_month]}")
+
+    # 11개 섹터 현재 200일선 상태
+    if st.button("🔍 11개 섹터 현재 200일선 상태 스캔", type="primary", key="sector_scan"):
+        with st.spinner("섹터 ETF 스캔 중..."):
+            rows = []
+            for tk, name in _SECTOR_ETFS.items():
+                r = _ds_status(tk)
+                if not r:
+                    rows.append({"섹터": name, "ETF": tk, "현재가": "-",
+                                 "200일선": "-", "괴리율": "-", "상태": "데이터 없음"})
+                    continue
+                stt = "🟢 200일선 위" if r["above"] else "🔴 200일선 아래"
+                if r["signal"] != "-":
+                    stt = r["signal"]
+                rows.append({
+                    "섹터": name, "ETF": tk,
+                    "현재가": f"{r['close']:,.2f}", "200일선": f"{r['ma']:,.2f}",
+                    "괴리율": f"{r['gap']:+.1f}%", "상태": stt,
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    # 월별 순환매 캘린더
+    st.markdown("#### 📅 순환매 캘린더 (매달 최강/최약)")
+    cal = pd.DataFrame([{
+        "월": _MONTH_NAMES[m],
+        "최강 섹터": _MONTH_BEST_WORST[m][0], "수익률": _MONTH_BEST_WORST[m][1],
+        "최약 섹터": _MONTH_BEST_WORST[m][2], "수익률 ": _MONTH_BEST_WORST[m][3],
+        "TOP3": " · ".join(_MONTH_TOP3[m][:3]),
+    } for m in range(1, 13)])
+    # 이번 달 강조를 위해 마커
+    cal["월"] = [f"👉 {_MONTH_NAMES[m]}" if m == cur_month else _MONTH_NAMES[m] for m in range(1, 13)]
+    st.dataframe(cal, use_container_width=True, hide_index=True)
+
+    # 계절별 패턴 + 특이점
+    with st.expander("🌸 계절별 패턴 & 핵심 특이점", expanded=False):
+        st.markdown("""
+**계절별 주인공**
+- **봄 (3~5월)**: 에너지 + 소재 + 산업재 (건설·제조·드라이빙 시즌 수요)
+- **여름 (6~8월)**: 부동산(승률 91%) + IT + 커뮤니케이션
+- **가을 (9~11월)**: IT + 소재 + 산업재 (아이폰·3분기 실적·내년 경기 기대)
+- **겨울 (12~2월)**: 커뮤니케이션 + 에너지 (신년 광고비·한파)
+
+**핵심 특이점**
+- **9월**: 유틸리티(XLU)만 유일하게 플러스(+0.1%, 승률 63%). 나머지 10개 섹터 전부 약세. → 주식 하려면 유틸리티, 아니면 현금.
+- **11월**: 11개 섹터 **전부 플러스**. 승률 70%+ 섹터가 8개. "아무거나 사도 3번 중 2번 수익". 10월 말 매수가 정답.
+- **부동산**: 6~7월 승률 91%(전 섹터 최고), 9월 -3%(최악).
+- **소재**: 11월 승률 81%(전 섹터/월 조합 TOP급).
+- **커뮤니케이션**: 1월 +4.2%(단일 최고), 9월 -2.0%.
+        """)
+
+    with st.expander("🎊 11월은 왜 전 섹터가 오르나 (수익률/승률)", expanded=False):
+        st.dataframe(pd.DataFrame(_NOV_STRENGTH, columns=["섹터", "11월 수익", "승률"]),
+                     use_container_width=True, hide_index=True)
+        st.markdown("세금 손실 매도(10월) 종료 후 재매수 · 산타랠리 · 선거 불확실성 해소 · "
+                    "블랙프라이데이 소비 기대 · 기관 연말 성과 매수")
+
+    st.caption("데이터: Yahoo Finance 섹터 ETF, 1999~2026 (내장값). "
+               "XLC(2018)·XLRE(2015)는 표본이 짧음. 순환매는 확률이지 확정이 아니며, "
+               "과거 패턴이 미래를 보장하지 않습니다.")
 
 
 def render_recovery():
@@ -1298,16 +1436,14 @@ def _babytqqq_rules():
 # ------------------------------------------------------------
 st.title("📈 200일선 투자 도구 모음")
 
-# 즐겨찾기를 localStorage에서 앱 최상단에서 한 번 로드 (탭 렌더 전에 값 확보)
-_load_favs_once()
-
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "🎯 위치별 승률 스크리너",
     "🪙 크립토 200일선+MVRV",
     "🌡️ 시장 붕괴 경고",
     "📋 데일리 스캐너",
     "🍼 아기티큐 TQQQ 전략",
     "🔄 200일선 복귀 기간",
+    "🗓️ 섹터 순환매",
 ])
 
 with tab2:
@@ -1320,6 +1456,8 @@ with tab5:
     render_babytqqq()
 with tab6:
     render_recovery()
+with tab7:
+    render_sector_rotation()
 
 # ===== 탭 1: 기존 위치별 승률 스크리너 =====
 tab1.markdown("**종목 검색 → 200일선 대비 모든 위치 구간의 역사적 승률을 한눈에**")
@@ -1470,19 +1608,17 @@ with tab1:
 
             # --- 즐겨찾기 버튼 ---
             fav_ticker = ticker  # 변환된 최종 티커
-            # 저장 컴포넌트가 브라우저에 그려질 시간을 주기 위해 st.rerun() 은 쓰지 않는다.
             if is_favorite(fav_ticker):
                 if st.button("⭐ 즐겨찾기 해제", key="unfav"):
                     remove_favorite(fav_ticker)
-                    st.success(f"'{display_name}' 를 즐겨찾기에서 제거했어요.")
-                else:
-                    st.caption("⭐ 즐겨찾기됨 · 데일리 스캐너 탭에서 볼 수 있어요.")
+                    st.rerun()
+                st.caption("⭐ 즐겨찾기됨 · 데일리 스캐너 탭에서 볼 수 있어요. "
+                           "이 페이지를 북마크/홈화면에 추가하면 즐겨찾기가 유지돼요.")
             else:
                 if st.button("☆ 즐겨찾기 추가", key="addfav"):
                     add_favorite(fav_ticker, display_name)
-                    st.success(f"'{display_name}' 를 즐겨찾기에 추가했어요! 데일리 스캐너 탭에서 확인하세요.")
-                else:
-                    st.caption("☆ 아직 즐겨찾기에 없어요.")
+                    st.rerun()
+                st.caption("☆ 추가하면 데일리 스캐너 탭에서 모아볼 수 있어요.")
             st.markdown(f"🎯 목표 **+{target_pct:.0f}%** / 🛑 손절 **-{stop_pct:.0f}%** | "
                         f"최대보유: **{max_hold_choice}** | "
                         f"구간 폭: **{band_width}%** / 완충: **{step}%**")

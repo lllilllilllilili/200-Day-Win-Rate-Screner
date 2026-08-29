@@ -3,4 +3,3 @@ yfinance>=0.2.40
 pandas>=2.0
 numpy>=1.24
 finance-datareader>=0.9.50
-streamlit-local-storage>=0.0.15
