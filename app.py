@@ -21,6 +21,8 @@ st.set_page_config(page_title="200일선 승률 스크리너", page_icon="📈",
 # 즐겨찾기 (브라우저 localStorage 저장, 폰에서 계속 유지)
 # ------------------------------------------------------------
 _FAV_KEY = "winrate_favorites"
+_FAV_STATE = "_fav_cache"        # session_state 캐시 키
+_FAV_LOADED = "_fav_loaded"      # localStorage에서 한 번 읽었는지 플래그
 
 try:
     from streamlit_local_storage import LocalStorage
@@ -31,44 +33,68 @@ except Exception:
     _LS_AVAILABLE = False
 
 
-def get_favorites() -> list:
-    """저장된 즐겨찾기 목록 [{'ticker':..., 'name':...}, ...] 반환."""
-    if not _LS_AVAILABLE:
-        return st.session_state.get(_FAV_KEY, [])
+def _parse_favs(raw):
+    import json as _j
+    if not raw:
+        return []
     try:
-        raw = _local_storage.getItem(_FAV_KEY)
-        if not raw:
-            return []
-        import json as _j
         data = _j.loads(raw) if isinstance(raw, str) else raw
         return data if isinstance(data, list) else []
     except Exception:
         return []
 
 
-def save_favorites(favs: list):
-    """즐겨찾기 목록 저장."""
-    import json as _j
+def _load_favs_once():
+    """앱 실행 시 localStorage에서 즐겨찾기를 한 번 읽어 session_state에 캐시."""
+    if _FAV_STATE in st.session_state and st.session_state.get(_FAV_LOADED):
+        return
     if not _LS_AVAILABLE:
-        st.session_state[_FAV_KEY] = favs
+        st.session_state.setdefault(_FAV_STATE, [])
+        st.session_state[_FAV_LOADED] = True
         return
     try:
-        _local_storage.setItem(_FAV_KEY, _j.dumps(favs, ensure_ascii=False))
+        raw = _local_storage.getItem(_FAV_KEY)
+        st.session_state[_FAV_STATE] = _parse_favs(raw)
+        # getItem은 비동기라 첫 호출에 None이 올 수 있음. 값이 오면 loaded 처리.
+        if raw is not None:
+            st.session_state[_FAV_LOADED] = True
     except Exception:
-        st.session_state[_FAV_KEY] = favs
+        st.session_state.setdefault(_FAV_STATE, [])
+        st.session_state[_FAV_LOADED] = True
+
+
+def get_favorites() -> list:
+    """현재 즐겨찾기 목록 (session_state 캐시 기준)."""
+    _load_favs_once()
+    return st.session_state.get(_FAV_STATE, [])
+
+
+def _persist_favs(favs: list):
+    """session_state 갱신 + localStorage에 영구 저장 (고유 key로 컴포넌트 충돌 방지)."""
+    import json as _j
+    import time as _time
+    st.session_state[_FAV_STATE] = favs
+    if not _LS_AVAILABLE:
+        return
+    try:
+        # 매 저장마다 고유 key -> 컴포넌트 충돌/캐시 문제 방지
+        uniq = f"set_fav_{int(_time.time() * 1000)}"
+        _local_storage.setItem(_FAV_KEY, _j.dumps(favs, ensure_ascii=False), key=uniq)
+    except Exception:
+        pass
 
 
 def add_favorite(ticker: str, name: str):
-    favs = get_favorites()
+    favs = list(get_favorites())
     if not any(f.get("ticker") == ticker for f in favs):
         favs.append({"ticker": ticker, "name": name})
-        save_favorites(favs)
+        _persist_favs(favs)
     return favs
 
 
 def remove_favorite(ticker: str):
     favs = [f for f in get_favorites() if f.get("ticker") != ticker]
-    save_favorites(favs)
+    _persist_favs(favs)
     return favs
 
 
@@ -1152,6 +1178,9 @@ def _babytqqq_rules():
 # ------------------------------------------------------------
 st.title("📈 200일선 투자 도구 모음")
 
+# 즐겨찾기를 localStorage에서 앱 최상단에서 한 번 로드 (탭 렌더 전에 값 확보)
+_load_favs_once()
+
 tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "🎯 위치별 승률 스크리너",
     "🪙 크립토 200일선+MVRV",
@@ -1318,18 +1347,19 @@ with tab1:
 
             # --- 즐겨찾기 버튼 ---
             fav_ticker = ticker  # 변환된 최종 티커
+            # 저장 컴포넌트가 브라우저에 그려질 시간을 주기 위해 st.rerun() 은 쓰지 않는다.
             if is_favorite(fav_ticker):
                 if st.button("⭐ 즐겨찾기 해제", key="unfav"):
                     remove_favorite(fav_ticker)
                     st.success(f"'{display_name}' 를 즐겨찾기에서 제거했어요.")
-                    st.rerun()
                 else:
                     st.caption("⭐ 즐겨찾기됨 · 데일리 스캐너 탭에서 볼 수 있어요.")
             else:
                 if st.button("☆ 즐겨찾기 추가", key="addfav"):
                     add_favorite(fav_ticker, display_name)
                     st.success(f"'{display_name}' 를 즐겨찾기에 추가했어요! 데일리 스캐너 탭에서 확인하세요.")
-                    st.rerun()
+                else:
+                    st.caption("☆ 아직 즐겨찾기에 없어요.")
             st.markdown(f"🎯 목표 **+{target_pct:.0f}%** / 🛑 손절 **-{stop_pct:.0f}%** | "
                         f"최대보유: **{max_hold_choice}** | "
                         f"구간 폭: **{band_width}%** / 완충: **{step}%**")
