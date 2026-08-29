@@ -17,6 +17,64 @@ from datetime import datetime
 
 st.set_page_config(page_title="200일선 승률 스크리너", page_icon="📈", layout="wide")
 
+# ------------------------------------------------------------
+# 즐겨찾기 (브라우저 localStorage 저장, 폰에서 계속 유지)
+# ------------------------------------------------------------
+_FAV_KEY = "winrate_favorites"
+
+try:
+    from streamlit_local_storage import LocalStorage
+    _local_storage = LocalStorage()
+    _LS_AVAILABLE = True
+except Exception:
+    _local_storage = None
+    _LS_AVAILABLE = False
+
+
+def get_favorites() -> list:
+    """저장된 즐겨찾기 목록 [{'ticker':..., 'name':...}, ...] 반환."""
+    if not _LS_AVAILABLE:
+        return st.session_state.get(_FAV_KEY, [])
+    try:
+        raw = _local_storage.getItem(_FAV_KEY)
+        if not raw:
+            return []
+        import json as _j
+        data = _j.loads(raw) if isinstance(raw, str) else raw
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def save_favorites(favs: list):
+    """즐겨찾기 목록 저장."""
+    import json as _j
+    if not _LS_AVAILABLE:
+        st.session_state[_FAV_KEY] = favs
+        return
+    try:
+        _local_storage.setItem(_FAV_KEY, _j.dumps(favs, ensure_ascii=False))
+    except Exception:
+        st.session_state[_FAV_KEY] = favs
+
+
+def add_favorite(ticker: str, name: str):
+    favs = get_favorites()
+    if not any(f.get("ticker") == ticker for f in favs):
+        favs.append({"ticker": ticker, "name": name})
+        save_favorites(favs)
+    return favs
+
+
+def remove_favorite(ticker: str):
+    favs = [f for f in get_favorites() if f.get("ticker") != ticker]
+    save_favorites(favs)
+    return favs
+
+
+def is_favorite(ticker: str) -> bool:
+    return any(f.get("ticker") == ticker for f in get_favorites())
+
 # -- Custom CSS for dark table styling --
 st.markdown("""
 <style>
@@ -739,9 +797,44 @@ def render_kr_winzone():
         unsafe_allow_html=True)
 
 
+def render_favorites_section():
+    """즐겨찾기한 종목들의 현재 200일선 상태 표시."""
+    favs = get_favorites()
+    st.markdown("#### ⭐ 내 즐겨찾기")
+    if not favs:
+        st.info("아직 즐겨찾기한 종목이 없어요. '위치별 승률 스크리너' 탭에서 종목 조회 후 "
+                "**☆ 즐겨찾기 추가**를 누르면 여기에 표시됩니다.")
+        return
+
+    rows = []
+    for f in favs:
+        ticker, name = f.get("ticker"), f.get("name", f.get("ticker"))
+        r = _ds_status(ticker)
+        if not r:
+            rows.append({"종목": name, "종가": "-", "200SMA": "-",
+                         "괴리율": "-", "위/아래": "-", "신호": "데이터 없음"})
+            continue
+        rows.append({
+            "종목": name, "종가": f"{r['close']:,.2f}", "200SMA": f"{r['ma']:,.2f}",
+            "괴리율": f"{r['gap']:+.1f}%", "위/아래": "위" if r["above"] else "아래",
+            "신호": r["signal"],
+        })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.caption(f"총 {len(favs)}개 즐겨찾기 · 브라우저에 저장되어 이 기기에서 계속 유지됩니다.")
+
+
 def render_daily_screener():
     st.subheader("📋 데일리 스캐너")
     st.caption("지수·미국 대형주·국장 대표주·알트코인의 200일선 상태와 돌파/이탈 신호를 한 번에.")
+
+    # 즐겨찾기는 버튼 없이 항상 상단에 표시 (있을 때만 스캔)
+    if get_favorites():
+        with st.spinner("즐겨찾기 상태 스캔 중..."):
+            render_favorites_section()
+        st.markdown("---")
+    else:
+        render_favorites_section()
+        st.markdown("---")
 
     if not st.button("🔍 데일리 스캔", type="primary", key="daily_scan"):
         st.info("버튼을 눌러 오늘의 200일선 상태를 스캔하세요. (종목이 많아 20~40초 걸릴 수 있어요)")
@@ -937,6 +1030,21 @@ with tab1:
                 f"({total_days:,} 거래일) "
                 f"<span style='color:gray'>· 앞 200일은 200일선 계산에 사용되어 분석에서 제외</span>",
                 unsafe_allow_html=True)
+
+            # --- 즐겨찾기 버튼 ---
+            fav_ticker = ticker  # 변환된 최종 티커
+            if is_favorite(fav_ticker):
+                if st.button("⭐ 즐겨찾기 해제", key="unfav"):
+                    remove_favorite(fav_ticker)
+                    st.success(f"'{display_name}' 를 즐겨찾기에서 제거했어요.")
+                    st.rerun()
+                else:
+                    st.caption("⭐ 즐겨찾기됨 · 데일리 스캐너 탭에서 볼 수 있어요.")
+            else:
+                if st.button("☆ 즐겨찾기 추가", key="addfav"):
+                    add_favorite(fav_ticker, display_name)
+                    st.success(f"'{display_name}' 를 즐겨찾기에 추가했어요! 데일리 스캐너 탭에서 확인하세요.")
+                    st.rerun()
             st.markdown(f"🎯 목표 **+{target_pct:.0f}%** / 🛑 손절 **-{stop_pct:.0f}%** | "
                         f"최대보유: **{max_hold_choice}** | "
                         f"구간 폭: **{band_width}%** / 완충: **{step}%**")
