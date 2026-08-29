@@ -483,6 +483,10 @@ if proceed and resolved_ticker:
         cur_sma = float(df["SMA200"].iloc[-1])
         last_date = df.index[-1].strftime("%Y-%m-%d")
         total_days = len(df)
+        raw_start = raw.index[0].strftime("%Y-%m-%d")   # 원본 데이터 시작일
+        raw_end = raw.index[-1].strftime("%Y-%m-%d")    # 원본 데이터 마지막일
+        analysis_start = df.index[0].strftime("%Y-%m-%d")  # 200일선 계산 후 분석 시작일
+        raw_years = (raw.index[-1] - raw.index[0]).days / 365.25
 
         # --- 현재 위치 요약 ---
         st.markdown("---")
@@ -494,9 +498,16 @@ if proceed and resolved_ticker:
         gap_display = f"{cur_gap:+.1f}%"
         c4.metric("200일선 대비", gap_display)
 
-        st.markdown(f"데이터: **{total_days}** 거래일 | 🎯 목표 **+{target_pct:.0f}%** / "
-                    f"🛑 손절 **-{stop_pct:.0f}%** | 최대보유: **{max_hold_choice}** | "
-                    f"구간 폭: **{band_width}%** / 완충: **{step}%** | 기준일: {last_date}")
+        st.markdown(
+            f"📅 **데이터 기간**: {raw_start} ~ {raw_end} "
+            f"(약 {raw_years:.1f}년, {len(raw):,} 거래일)  \n"
+            f"🔎 **분석 구간**: {analysis_start} ~ {last_date} "
+            f"({total_days:,} 거래일) "
+            f"<span style='color:gray'>· 앞 200일은 200일선 계산에 사용되어 분석에서 제외</span>",
+            unsafe_allow_html=True)
+        st.markdown(f"🎯 목표 **+{target_pct:.0f}%** / 🛑 손절 **-{stop_pct:.0f}%** | "
+                    f"최대보유: **{max_hold_choice}** | "
+                    f"구간 폭: **{band_width}%** / 완충: **{step}%**")
 
         # --- 구간별 전수조사 ---
         with st.spinner("전수조사 계산 중..."):
