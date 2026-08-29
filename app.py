@@ -357,13 +357,331 @@ def zone_analysis(df: pd.DataFrame, band_width: float, step: float,
     return pd.DataFrame(rows)
 
 
+# ============================================================
+# 추가 도구 1: 크립토 200일선 × MVRV 스크리너
+# ============================================================
+import urllib.request
+import json as _json
+from datetime import timedelta
+
+_CRYPTO_ASSETS = [
+    {'ticker': 'BTC-USD', 'name': 'BTC (비트코인)', 'short': 'BTC', 'buffer': 0.06, 'has_mvrv': True},
+    {'ticker': 'ETH-USD', 'name': 'ETH (이더리움)', 'short': 'ETH', 'buffer': 0.06, 'has_mvrv': False},
+]
+_MVRV_ZONES = {
+    'strong_buy': (0, 1.0), 'buy': (1.0, 1.5), 'neutral': (1.5, 2.0),
+    'caution': (2.0, 2.5), 'overheated': (2.5, 3.0), 'extreme': (3.0, float('inf')),
+}
+_MVRV_LABEL = {
+    'strong_buy': ('🟢🟢', '강력 매수 구간 (역사적 바닥)'),
+    'buy': ('🟢', '매수 적극 (저평가)'),
+    'neutral': ('🟡', '관망/소량 매수 (중립)'),
+    'caution': ('🟠', '매수 자제 (과열 시작)'),
+    'overheated': ('🔴', '부분 익절 고려 (과열)'),
+    'extreme': ('🔴🔴', '적극 익절 (극도 과열)'),
+}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _load_btc_mvrv():
+    try:
+        url = "https://bitcoin-data.com/v1/mvrv"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = _json.loads(resp.read().decode())
+        df = pd.DataFrame(data)
+        df['date'] = pd.to_datetime(df['d'])
+        return df.set_index('date')[['mvrv']].sort_index()
+    except Exception:
+        return None
+
+
+def _mvrv_zone(v):
+    for zone, (lo, hi) in _MVRV_ZONES.items():
+        if lo <= v < hi:
+            return zone
+    return 'extreme'
+
+
+def render_crypto_screener():
+    st.subheader("🪙 크립토 200일선 × MVRV 스크리너")
+    st.caption("BTC·ETH의 200일선 상태와 BTC MVRV(온체인 밸류에이션)를 함께 봅니다.")
+
+    if not st.button("🔍 크립토 스캔", type="primary", key="crypto_scan"):
+        st.info("버튼을 눌러 최신 BTC·ETH 상태를 스캔하세요.")
+        return
+
+    with st.spinner("데이터 로딩 중..."):
+        btc_mvrv = _load_btc_mvrv()
+        rows = []
+        for asset in _CRYPTO_ASSETS:
+            raw = load_prices(asset['ticker'])
+            if raw.empty or len(raw) < 200:
+                continue
+            d = raw.copy()
+            d["SMA200"] = d["Close"].rolling(200).mean()
+            d = d.dropna()
+            price = float(d["Close"].iloc[-1])
+            sma = float(d["SMA200"].iloc[-1])
+            gap = (price / sma - 1) * 100
+            above = price > sma
+            sell_line = sma * (1 - asset['buffer'])
+            rows.append({
+                "자산": asset['short'], "현재가": price, "200일선": sma,
+                "괴리율": gap, "위/아래": "위" if above else "아래",
+                "매도선": sell_line, "이탈": price < sell_line,
+            })
+
+    if not rows:
+        st.error("크립토 데이터를 불러오지 못했어요.")
+        return
+
+    # MVRV 요약
+    if btc_mvrv is not None and len(btc_mvrv) > 0:
+        mv = float(btc_mvrv.iloc[-1]["mvrv"])
+        zone = _mvrv_zone(mv)
+        emoji, label = _MVRV_LABEL[zone]
+        mv_date = btc_mvrv.index[-1].strftime("%Y-%m-%d")
+        st.markdown(f"**BTC MVRV**: {mv:.3f} {emoji} — {label}  \n"
+                    f"<span style='color:gray'>기준일 {mv_date} · MVRV 1.5 이하면 크립토 전반 저평가</span>",
+                    unsafe_allow_html=True)
+    else:
+        st.warning("BTC MVRV 데이터를 불러오지 못했어요 (외부 API). 가격/200일선 정보만 표시합니다.")
+
+    # 대시보드 테이블
+    table = pd.DataFrame([{
+        "자산": r["자산"],
+        "현재가": f"{r['현재가']:,.2f}",
+        "200일선": f"{r['200일선']:,.2f}",
+        "괴리율": f"{r['괴리율']:+.1f}%",
+        "위/아래": r["위/아래"],
+        "매도선(6%완충)": f"{r['매도선']:,.2f}",
+        "상태": "🚨 이탈" if r["이탈"] else ("✅ 위" if r["위/아래"] == "위" else "⏸️ 아래"),
+    } for r in rows])
+    st.dataframe(table, use_container_width=True, hide_index=True)
+    st.caption("⚠️ 과거 데이터 기반 분석이며 투자 권유가 아닙니다.")
+
+
+# ============================================================
+# 추가 도구 2: 시장 붕괴 경고 스캐너 (간소화)
+# ============================================================
+def _safe_dl(ticker, period="1y"):
+    try:
+        data = yf.download(ticker, period=period, auto_adjust=True, progress=False)
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
+        if data.empty:
+            return None
+        # 최근일 종가가 아직 미확정(nan)인 경우가 있어 Close 기준으로 정리
+        if "Close" in data.columns:
+            data = data.dropna(subset=["Close"])
+        return None if data.empty else data.sort_index()
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _crash_indicators():
+    """시장 데이터 기반 지표들을 계산. (외부 매크로 지표는 프록시/근사)"""
+    out = []
+
+    # VIX
+    vix = _safe_dl("^VIX")
+    if vix is not None and not vix.empty:
+        v = float(vix["Close"].iloc[-1])
+        avg = float(vix["Close"].mean())
+        if v < 12: score, stt = 60, "경계"
+        elif v < 15: score, stt = 40, "경계"
+        elif v < 20: score, stt = 20, "정상"
+        elif v < 25: score, stt = 30, "정상"
+        elif v < 30: score, stt = 50, "경계"
+        else: score, stt = 90, "점등"
+        out.append(("VIX (공포지수)", f"{v:.1f} (1년평균 {avg:.1f})", stt, score,
+                    "극단적 저(안일)/고(패닉) 모두 경고"))
+
+    # 수익률 곡선 10Y-3M
+    tnx, irx = _safe_dl("^TNX"), _safe_dl("^IRX")
+    if tnx is not None and irx is not None and not tnx.empty and not irx.empty:
+        spread = float(tnx["Close"].iloc[-1]) - float(irx["Close"].iloc[-1])
+        if spread < -0.5: score, stt = 60, "점등"
+        elif spread < 0: score, stt = 70, "점등"
+        elif spread < 0.3: score, stt = 80, "경계"
+        elif spread < 0.8: score, stt = 50, "경계"
+        else: score, stt = 20, "정상"
+        out.append(("수익률 곡선 (10Y-3M)", f"{spread:.2f}%", stt, score,
+                    "역전 후 정상화 시 침체 임박 신호"))
+
+    # 시장 폭: SPY vs RSP (6개월)
+    spy6, rsp6 = _safe_dl("SPY", "6mo"), _safe_dl("RSP", "6mo")
+    if spy6 is not None and rsp6 is not None and not spy6.empty and not rsp6.empty:
+        sr = (float(spy6["Close"].iloc[-1]) / float(spy6["Close"].iloc[0]) - 1) * 100
+        rr = (float(rsp6["Close"].iloc[-1]) / float(rsp6["Close"].iloc[0]) - 1) * 100
+        div = sr - rr
+        ad = abs(div) if div > 0 else 0
+        if ad <= 2: score = 10
+        elif ad >= 15: score = 100
+        else: score = min(100, int((ad - 2) / 13 * 100))
+        stt = "점등" if div >= 10 else ("경계" if div >= 5 else "정상")
+        out.append(("시장 폭 (SPY vs RSP, 6M)", f"{div:+.1f}%p", stt, score,
+                    "괴리 클수록 소수 대형주 의존"))
+
+    # S&P500 vs 200일선
+    spy = _safe_dl("SPY")
+    if spy is not None and not spy.empty and len(spy) >= 200:
+        cur = float(spy["Close"].iloc[-1])
+        sma = float(spy["Close"].iloc[-200:].mean())
+        pct = (cur - sma) / sma * 100
+        if pct < -5: score, stt = 90, "점등"
+        elif pct < 0: score, stt = 60, "경계"
+        elif pct > 15: score, stt = 40, "경계"
+        else: score, stt = 15, "정상"
+        out.append(("S&P500 vs 200일선", f"{pct:+.1f}%", stt, score,
+                    "200일선 이탈 = 하락 추세, 기관 매도 트리거"))
+
+    return out
+
+
+def render_crash_scanner():
+    st.subheader("🌡️ 시장 붕괴 경고 스캐너")
+    st.caption("시장 데이터 기반 위험 지표를 종합해 위험도를 산출합니다. (매크로 지표는 프록시/근사)")
+
+    if not st.button("🔍 위험도 스캔", type="primary", key="crash_scan"):
+        st.info("버튼을 눌러 현재 시장 위험 지표를 스캔하세요.")
+        return
+
+    with st.spinner("시장 데이터 수집 중... (약 10~30초)"):
+        inds = _crash_indicators()
+
+    if not inds:
+        st.error("데이터를 불러오지 못했어요. 잠시 후 다시 시도해 주세요.")
+        return
+
+    scores = [i[3] for i in inds]
+    overall = int(np.mean(scores)) if scores else 0
+    lit = sum(1 for i in inds if i[2] == "점등")
+    caution = sum(1 for i in inds if i[2] == "경계")
+    normal = sum(1 for i in inds if i[2] == "정상")
+
+    if overall >= 75:
+        level, rec, box = "위험", "주식 비중 대폭 축소, 현금/국채/금 확대", st.error
+    elif overall >= 55:
+        level, rec, box = "경계", "신규 매수 자제, 레버리지 해제, 현금 20~30% 확보", st.warning
+    elif overall >= 35:
+        level, rec, box = "주의", "포트폴리오 점검, 분산 유지, 급등주 차익 실현 검토", st.warning
+    else:
+        level, rec, box = "안전", "정상 투자 유지, 장기 매수 전략 지속", st.success
+
+    box(f"**종합 위험도 {overall}/100 [{level}]** · 점등 {lit} / 경계 {caution} / 정상 {normal}  \n권고: {rec}")
+
+    mark = {"점등": "🔴", "경계": "🟡", "정상": "🟢"}
+    table = pd.DataFrame([{
+        "지표": name, "값": val, "상태": f"{mark.get(stt,'⚪')} {stt}",
+        "점수": score, "설명": desc,
+    } for name, val, stt, score, desc in inds])
+    st.dataframe(table, use_container_width=True, hide_index=True)
+    st.caption("⚠️ 일부 매크로 지표는 시장 데이터 기반 근사치입니다. 참고용이며 투자 권유가 아닙니다.")
+
+
+# ============================================================
+# 추가 도구 3: 데일리 스캐너 (200일선 상태 모니터)
+# ============================================================
+_DS_INDICES = {'QQQ': '나스닥100', 'SPY': 'S&P500', '069500.KS': '코스피(ETF)'}
+_DS_US_TIER1 = ['NVDA', 'META', 'GOOGL', 'AAPL', 'CRM', 'MA', 'CSCO']
+_DS_ALT = ['ETH-USD', 'SOL-USD', 'DOGE-USD', 'XRP-USD', 'ADA-USD', 'AVAX-USD', 'LINK-USD', 'BNB-USD']
+_DS_KR = {
+    '005930.KS': '삼성전자', '000660.KS': 'SK하이닉스', '005380.KS': '현대차',
+    '000270.KS': '기아', '051910.KS': 'LG화학', '105560.KS': 'KB금융',
+    '030200.KS': 'KT', '055550.KS': '신한지주',
+}
+
+
+def _ds_status(ticker):
+    """종가/200SMA/괴리/돌파신호 반환."""
+    data = _safe_dl(ticker, "2y")
+    if data is None or len(data) < 201:
+        return None
+    data = data.copy()
+    data["MA200"] = data["Close"].rolling(200).mean()
+    data = data.dropna(subset=["MA200"])
+    if len(data) < 2:
+        return None
+    close = float(data["Close"].iloc[-1])
+    ma = float(data["MA200"].iloc[-1])
+    pclose = float(data["Close"].iloc[-2])
+    pma = float(data["MA200"].iloc[-2])
+    gap = (close / ma - 1) * 100
+    signal = "-"
+    if pclose <= pma and close > ma:
+        signal = "🟢 BUY (돌파)"
+    elif pclose >= pma and close < ma:
+        signal = "🔴 SELL (이탈)"
+    return {"close": close, "ma": ma, "gap": gap, "above": close > ma, "signal": signal}
+
+
+def _ds_table(items):
+    rows = []
+    for ticker, name in items:
+        r = _ds_status(ticker)
+        if not r:
+            continue
+        rows.append({
+            "종목": name, "종가": f"{r['close']:,.2f}", "200SMA": f"{r['ma']:,.2f}",
+            "괴리율": f"{r['gap']:+.1f}%", "위/아래": "위" if r["above"] else "아래",
+            "신호": r["signal"],
+        })
+    return pd.DataFrame(rows)
+
+
+def render_daily_screener():
+    st.subheader("📋 데일리 스캐너")
+    st.caption("지수·미국 대형주·국장 대표주·알트코인의 200일선 상태와 돌파/이탈 신호를 한 번에.")
+
+    if not st.button("🔍 데일리 스캔", type="primary", key="daily_scan"):
+        st.info("버튼을 눌러 오늘의 200일선 상태를 스캔하세요. (종목이 많아 20~40초 걸릴 수 있어요)")
+        return
+
+    with st.spinner("지수 스캔 중..."):
+        st.markdown("#### 📊 지수")
+        st.dataframe(_ds_table(list(_DS_INDICES.items())), use_container_width=True, hide_index=True)
+
+    with st.spinner("미국 대형주 스캔 중..."):
+        st.markdown("#### 🇺🇸 미국 주요주")
+        st.dataframe(_ds_table([(t, t) for t in _DS_US_TIER1]), use_container_width=True, hide_index=True)
+
+    with st.spinner("국장 대표주 스캔 중..."):
+        st.markdown("#### 🇰🇷 국장 대표주")
+        st.dataframe(_ds_table(list(_DS_KR.items())), use_container_width=True, hide_index=True)
+
+    with st.spinner("알트코인 스캔 중..."):
+        st.markdown("#### 🪙 알트코인")
+        st.dataframe(_ds_table([(t, t.replace("-USD", "")) for t in _DS_ALT]),
+                     use_container_width=True, hide_index=True)
+
+    st.caption("⚠️ 과거 데이터 기반이며 투자 권유가 아닙니다. BUY/SELL은 200일선 돌파/이탈 신호일 뿐입니다.")
+
+
 # ------------------------------------------------------------
 # UI
 # ------------------------------------------------------------
-st.title("📈 200일선 위치별 승률 스크리너")
-st.caption("종목 검색 → 200일선 대비 모든 위치 구간의 역사적 승률을 한눈에")
+st.title("📈 200일선 투자 도구 모음")
 
-with st.expander("💡 사용법 & 티커 예시", expanded=False):
+tab1, tab2, tab3, tab4 = st.tabs([
+    "🎯 위치별 승률 스크리너",
+    "🪙 크립토 200일선+MVRV",
+    "🌡️ 시장 붕괴 경고",
+    "📋 데일리 스캐너",
+])
+
+with tab2:
+    render_crypto_screener()
+with tab3:
+    render_crash_scanner()
+with tab4:
+    render_daily_screener()
+
+# ===== 탭 1: 기존 위치별 승률 스크리너 =====
+tab1.markdown("**종목 검색 → 200일선 대비 모든 위치 구간의 역사적 승률을 한눈에**")
+with tab1.expander("💡 사용법 & 티커 예시", expanded=False):
     st.markdown("""
 - **미국주식/ETF**: `AAPL`, `TSLA`, `QQQ`, `TQQQ`, `SOXL`
 - **코인**: `BTC-USD`, `ETH-USD`, `SOL-USD`
@@ -382,35 +700,37 @@ with st.expander("💡 사용법 & 티커 예시", expanded=False):
 위치 변화를 더 촘촘하게 볼 수 있어요 (예: 폭 10% / 완충 5%).
     """)
 
-c_a, c_b, c_c = st.columns([3, 1, 1])
-with c_a:
-    ticker = st.text_input("종목 티커 / 기업명", value="TQQQ",
-                           placeholder="예: AAPL, BTC-USD, 005930.KS, 삼성전자, 카카오")
-with c_b:
-    band_width = st.selectbox("구간 폭", [5, 10, 15, 20], index=1,
-                              help="한 구간이 커버하는 범위 (예: 10%면 중심±5%)")
-with c_c:
-    step = st.selectbox("중심 간격 (완충)", [1, 2, 5, 10], index=2,
-                        help="행을 얼마나 촘촘히 찍을지. 구간 폭보다 작으면 구간이 겹칩니다(슬라이딩).")
+# 탭1의 모든 위젯을 tab1 컨텍스트에 렌더링
+with tab1:
+    c_a, c_b, c_c = st.columns([3, 1, 1])
+    with c_a:
+        ticker = st.text_input("종목 티커 / 기업명", value="TQQQ",
+                               placeholder="예: AAPL, BTC-USD, 005930.KS, 삼성전자, 카카오")
+    with c_b:
+        band_width = st.selectbox("구간 폭", [5, 10, 15, 20], index=1,
+                                  help="한 구간이 커버하는 범위 (예: 10%면 중심±5%)")
+    with c_c:
+        step = st.selectbox("중심 간격 (완충)", [1, 2, 5, 10], index=2,
+                            help="행을 얼마나 촘촘히 찍을지. 구간 폭보다 작으면 구간이 겹칩니다(슬라이딩).")
 
-c1, c2, c3 = st.columns(3)
-with c1:
-    target_pct = st.number_input("🎯 목표수익 (익절 %)", min_value=1.0, max_value=100.0,
-                                 value=10.0, step=1.0,
-                                 help="이 수익률에 먼저 닿으면 승리(익절)")
-with c2:
-    stop_pct = st.number_input("🛑 손절 (완충 %)", min_value=1.0, max_value=100.0,
-                               value=5.0, step=1.0,
-                               help="이 손실률에 먼저 닿으면 패배(손절)")
-with c3:
-    max_hold_choice = st.selectbox("최대 보유기간", ["3개월(63일)", "6개월(126일)", "12개월(252일)", "24개월(504일)"],
-                                   index=2,
-                                   help="이 기간까지 목표·손절 둘 다 안 닿으면 만기 청산")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        target_pct = st.number_input("🎯 목표수익 (익절 %)", min_value=1.0, max_value=100.0,
+                                     value=10.0, step=1.0,
+                                     help="이 수익률에 먼저 닿으면 승리(익절)")
+    with c2:
+        stop_pct = st.number_input("🛑 손절 (완충 %)", min_value=1.0, max_value=100.0,
+                                   value=5.0, step=1.0,
+                                   help="이 손실률에 먼저 닿으면 패배(손절)")
+    with c3:
+        max_hold_choice = st.selectbox("최대 보유기간", ["3개월(63일)", "6개월(126일)", "12개월(252일)", "24개월(504일)"],
+                                       index=2,
+                                       help="이 기간까지 목표·손절 둘 다 안 닿으면 만기 청산")
 
-max_hold = {"3개월(63일)": 63, "6개월(126일)": 126, "12개월(252일)": 252, "24개월(504일)": 504}[max_hold_choice]
+    max_hold = {"3개월(63일)": 63, "6개월(126일)": 126, "12개월(252일)": 252, "24개월(504일)": 504}[max_hold_choice]
 
-# --- 설정 설명 (항상 표시) ---
-st.markdown("""
+    # --- 설정 설명 (항상 표시) ---
+    st.markdown("""
 <div style="border:1px solid #444; border-radius:8px; padding:14px 18px; margin:8px 0 4px 0; font-size:13.5px; line-height:1.7;">
   <b>⚙️ 설정 항목 설명</b><br>
   <b>· 구간 폭</b> — 한 행(구간)이 커버하는 200일선 대비 범위예요.
@@ -426,177 +746,177 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-run = st.button("🔍 전수조사", type="primary", use_container_width=True)
+    run = st.button("🔍 전수조사", type="primary", use_container_width=True)
 
-# --- 한글 기업명 → 종목코드 자동 변환 ---
-resolved_ticker = ticker.strip() if ticker else ""
-resolved_name = None
-proceed = run
+    # --- 한글 기업명 → 종목코드 자동 변환 ---
+    resolved_ticker = ticker.strip() if ticker else ""
+    resolved_name = None
+    proceed = run
 
-should_search_kr = run and ticker and (_has_korean(ticker) or not _looks_like_ticker(ticker))
+    should_search_kr = run and ticker and (_has_korean(ticker) or not _looks_like_ticker(ticker))
 
-if should_search_kr:
-    with st.spinner("한국 종목명 검색 중..."):
-        kind, payload, *rest = (*resolve_korean_name(ticker), None)
+    if should_search_kr:
+        with st.spinner("한국 종목명 검색 중..."):
+            kind, payload, *rest = (*resolve_korean_name(ticker), None)
 
-    if kind == "code":
-        code, name = payload, rest[0]
-        resolved_ticker = f"{code}.KS"  # yfinance/FDR 공용, FDR은 접미사 제거해서 사용
-        resolved_name = name
-        st.info(f"🇰🇷 '{ticker}' → **{name} ({code})** 로 변환했어요.")
-    elif kind == "candidates":
-        cands = payload
-        st.warning(f"'{ticker}' 와 일치하는 종목이 여러 개예요. 선택해 주세요:")
-        options = [f"{name} ({code}) · {market}" for code, name, market in cands]
-        chosen = st.selectbox("종목 선택", options, key="kr_candidate")
-        # 선택 확정 버튼
-        if st.button("✅ 이 종목으로 조회", key="confirm_candidate"):
-            idx = options.index(chosen)
-            code, name, _ = cands[idx]
-            resolved_ticker = f"{code}.KS"
+        if kind == "code":
+            code, name = payload, rest[0]
+            resolved_ticker = f"{code}.KS"  # yfinance/FDR 공용, FDR은 접미사 제거해서 사용
             resolved_name = name
-            proceed = True
+            st.info(f"🇰🇷 '{ticker}' → **{name} ({code})** 로 변환했어요.")
+        elif kind == "candidates":
+            cands = payload
+            st.warning(f"'{ticker}' 와 일치하는 종목이 여러 개예요. 선택해 주세요:")
+            options = [f"{name} ({code}) · {market}" for code, name, market in cands]
+            chosen = st.selectbox("종목 선택", options, key="kr_candidate")
+            # 선택 확정 버튼
+            if st.button("✅ 이 종목으로 조회", key="confirm_candidate"):
+                idx = options.index(chosen)
+                code, name, _ = cands[idx]
+                resolved_ticker = f"{code}.KS"
+                resolved_name = name
+                proceed = True
+            else:
+                proceed = False  # 아직 선택 대기
+        else:  # kind == "none"
+            if _has_korean(ticker):
+                # 한글로 검색했는데 못 찾음 -> 한국종목 의도가 명확하니 에러
+                st.error(f"'{ticker}' 에 해당하는 한국 종목을 찾지 못했어요. "
+                         f"정식 상장명이나 종목코드(예: 005930)로 시도해 보세요.")
+                proceed = False
+            # 영문인데 못 찾음 -> 해외 티커일 수 있으니 원본 그대로 yfinance 시도
+            # (resolved_ticker 는 원본 유지, proceed 도 run 값 그대로)
+
+    if proceed and resolved_ticker:
+        ticker = resolved_ticker  # 이후 로직은 변환된 티커 사용
+        with st.spinner(f"{ticker} 데이터 로딩 중..."):
+            raw = load_prices(ticker)
+
+        if raw.empty:
+            st.error("데이터를 찾을 수 없어요. 티커를 확인해 주세요.")
+        elif len(raw) < 250:
+            st.warning(f"데이터가 {len(raw)}일치뿐이라 200일선 분석이 어려워요 (최소 250일 필요).")
         else:
-            proceed = False  # 아직 선택 대기
-    else:  # kind == "none"
-        if _has_korean(ticker):
-            # 한글로 검색했는데 못 찾음 -> 한국종목 의도가 명확하니 에러
-            st.error(f"'{ticker}' 에 해당하는 한국 종목을 찾지 못했어요. "
-                     f"정식 상장명이나 종목코드(예: 005930)로 시도해 보세요.")
-            proceed = False
-        # 영문인데 못 찾음 -> 해외 티커일 수 있으니 원본 그대로 yfinance 시도
-        # (resolved_ticker 는 원본 유지, proceed 도 run 값 그대로)
+            df = prepare(raw)
+            cur_gap = float(df["gap"].iloc[-1])
+            cur_price = float(df["Close"].iloc[-1])
+            cur_sma = float(df["SMA200"].iloc[-1])
+            last_date = df.index[-1].strftime("%Y-%m-%d")
+            total_days = len(df)
+            raw_start = raw.index[0].strftime("%Y-%m-%d")   # 원본 데이터 시작일
+            raw_end = raw.index[-1].strftime("%Y-%m-%d")    # 원본 데이터 마지막일
+            analysis_start = df.index[0].strftime("%Y-%m-%d")  # 200일선 계산 후 분석 시작일
+            raw_years = (raw.index[-1] - raw.index[0]).days / 365.25
 
-if proceed and resolved_ticker:
-    ticker = resolved_ticker  # 이후 로직은 변환된 티커 사용
-    with st.spinner(f"{ticker} 데이터 로딩 중..."):
-        raw = load_prices(ticker)
+            # --- 현재 위치 요약 ---
+            st.markdown("---")
+            c1, c2, c3, c4 = st.columns(4)
+            display_name = resolved_name if resolved_name else ticker.upper()
+            c1.metric("종목", display_name)
+            c2.metric("현재가", f"{cur_price:,.2f}")
+            c3.metric("200일선", f"{cur_sma:,.2f}")
+            gap_display = f"{cur_gap:+.1f}%"
+            c4.metric("200일선 대비", gap_display)
 
-    if raw.empty:
-        st.error("데이터를 찾을 수 없어요. 티커를 확인해 주세요.")
-    elif len(raw) < 250:
-        st.warning(f"데이터가 {len(raw)}일치뿐이라 200일선 분석이 어려워요 (최소 250일 필요).")
-    else:
-        df = prepare(raw)
-        cur_gap = float(df["gap"].iloc[-1])
-        cur_price = float(df["Close"].iloc[-1])
-        cur_sma = float(df["SMA200"].iloc[-1])
-        last_date = df.index[-1].strftime("%Y-%m-%d")
-        total_days = len(df)
-        raw_start = raw.index[0].strftime("%Y-%m-%d")   # 원본 데이터 시작일
-        raw_end = raw.index[-1].strftime("%Y-%m-%d")    # 원본 데이터 마지막일
-        analysis_start = df.index[0].strftime("%Y-%m-%d")  # 200일선 계산 후 분석 시작일
-        raw_years = (raw.index[-1] - raw.index[0]).days / 365.25
+            st.markdown(
+                f"📅 **데이터 기간**: {raw_start} ~ {raw_end} "
+                f"(약 {raw_years:.1f}년, {len(raw):,} 거래일)  \n"
+                f"🔎 **분석 구간**: {analysis_start} ~ {last_date} "
+                f"({total_days:,} 거래일) "
+                f"<span style='color:gray'>· 앞 200일은 200일선 계산에 사용되어 분석에서 제외</span>",
+                unsafe_allow_html=True)
+            st.markdown(f"🎯 목표 **+{target_pct:.0f}%** / 🛑 손절 **-{stop_pct:.0f}%** | "
+                        f"최대보유: **{max_hold_choice}** | "
+                        f"구간 폭: **{band_width}%** / 완충: **{step}%**")
 
-        # --- 현재 위치 요약 ---
-        st.markdown("---")
-        c1, c2, c3, c4 = st.columns(4)
-        display_name = resolved_name if resolved_name else ticker.upper()
-        c1.metric("종목", display_name)
-        c2.metric("현재가", f"{cur_price:,.2f}")
-        c3.metric("200일선", f"{cur_sma:,.2f}")
-        gap_display = f"{cur_gap:+.1f}%"
-        c4.metric("200일선 대비", gap_display)
+            # --- 구간별 전수조사 ---
+            with st.spinner("전수조사 계산 중..."):
+                result = zone_analysis(df, band_width, step, target_pct, stop_pct, max_hold)
 
-        st.markdown(
-            f"📅 **데이터 기간**: {raw_start} ~ {raw_end} "
-            f"(약 {raw_years:.1f}년, {len(raw):,} 거래일)  \n"
-            f"🔎 **분석 구간**: {analysis_start} ~ {last_date} "
-            f"({total_days:,} 거래일) "
-            f"<span style='color:gray'>· 앞 200일은 200일선 계산에 사용되어 분석에서 제외</span>",
-            unsafe_allow_html=True)
-        st.markdown(f"🎯 목표 **+{target_pct:.0f}%** / 🛑 손절 **-{stop_pct:.0f}%** | "
-                    f"최대보유: **{max_hold_choice}** | "
-                    f"구간 폭: **{band_width}%** / 완충: **{step}%**")
+            if result.empty:
+                st.warning("분석할 데이터가 부족합니다.")
+            else:
+                # 현재 위치 = center가 현재 괴리율에 가장 가까운 구간
+                # (슬라이딩이라 현재 gap을 포함하는 구간이 여럿일 수 있음)
+                cur_zone_idx = int((result["center"] - cur_gap).abs().idxmin())
 
-        # --- 구간별 전수조사 ---
-        with st.spinner("전수조사 계산 중..."):
-            result = zone_analysis(df, band_width, step, target_pct, stop_pct, max_hold)
+                st.markdown(f"### 📊 [핵심] 200일선 대비 위치별 승률")
+                st.markdown(f"폭 {band_width}%, 완충 {step}%, 목표 +{target_pct:.0f}% / 손절 -{stop_pct:.0f}% "
+                            f"(먼저 닿는 쪽), 최대보유 {max_hold_choice} 기준 전수조사 결과:")
 
-        if result.empty:
-            st.warning("분석할 데이터가 부족합니다.")
-        else:
-            # 현재 위치 = center가 현재 괴리율에 가장 가까운 구간
-            # (슬라이딩이라 현재 gap을 포함하는 구간이 여럿일 수 있음)
-            cur_zone_idx = int((result["center"] - cur_gap).abs().idxmin())
-
-            st.markdown(f"### 📊 [핵심] 200일선 대비 위치별 승률")
-            st.markdown(f"폭 {band_width}%, 완충 {step}%, 목표 +{target_pct:.0f}% / 손절 -{stop_pct:.0f}% "
-                        f"(먼저 닿는 쪽), 최대보유 {max_hold_choice} 기준 전수조사 결과:")
-
-            # HTML 테이블 생성
-            html = '<table class="position-table">'
-            html += """<tr>
-                <th>중심 위치</th>
-                <th>구간</th>
-                <th>거래수</th>
-                <th>승률</th>
-                <th>평균 수익</th>
-                <th>최대 수익</th>
-                <th>평균 보유</th>
-            </tr>"""
-
-            for i, row in result.iterrows():
-                is_current = (i == cur_zone_idx)
-                row_class = ' class="current-row"' if is_current else ''
-
-                # 승률 색상
-                wr = row["win_rate"]
-                if wr >= 60:
-                    wr_cls = "win-high"
-                elif wr >= 45:
-                    wr_cls = "win-mid"
-                else:
-                    wr_cls = "win-low"
-
-                center_label = f"{row['center']:+.0f}%"
-                if abs(row["center"]) < 0.01:
-                    center_label = "0% (200일선)"
-
-                marker = " ◀ 현재" if is_current else ""
-
-                html += f"""<tr{row_class}>
-                    <td>{center_label}{marker}</td>
-                    <td>{row['zone_label']}</td>
-                    <td>{row['trades']}</td>
-                    <td class="{wr_cls}">{wr:.0f}%</td>
-                    <td>{row['avg_return']:+.1f}%</td>
-                    <td>{row['max_return']:+.1f}%</td>
-                    <td>{row['avg_holding_days']}일</td>
+                # HTML 테이블 생성
+                html = '<table class="position-table">'
+                html += """<tr>
+                    <th>중심 위치</th>
+                    <th>구간</th>
+                    <th>거래수</th>
+                    <th>승률</th>
+                    <th>평균 수익</th>
+                    <th>최대 수익</th>
+                    <th>평균 보유</th>
                 </tr>"""
 
-            html += "</table>"
-            st.markdown(html, unsafe_allow_html=True)
+                for i, row in result.iterrows():
+                    is_current = (i == cur_zone_idx)
+                    row_class = ' class="current-row"' if is_current else ''
 
-            # --- 현재 위치 결론 ---
-            if cur_zone_idx is not None:
-                cur_row = result.iloc[cur_zone_idx]
-                wr = cur_row["win_rate"]
-                rule = f"목표 +{target_pct:.0f}% / 손절 -{stop_pct:.0f}%, 표본 {cur_row['trades']}건"
-                st.markdown("---")
-                if wr >= 60:
-                    st.success(
-                        f"🟢 현재 위치({cur_gap:+.1f}%)에서 매수하면 **목표 도달 확률이 높았어요**. "
-                        f"승률 **{wr:.0f}%**, 평균 청산수익 **{cur_row['avg_return']:+.1f}%**, "
-                        f"평균 보유 **{cur_row['avg_holding_days']}일** ({rule})"
-                    )
-                elif wr >= 45:
-                    st.warning(
-                        f"🟡 현재 위치({cur_gap:+.1f}%)는 목표·손절이 반반이에요. "
-                        f"승률 **{wr:.0f}%**, 평균 청산수익 **{cur_row['avg_return']:+.1f}%**, "
-                        f"평균 보유 **{cur_row['avg_holding_days']}일** ({rule})"
-                    )
-                else:
-                    st.error(
-                        f"🔴 현재 위치({cur_gap:+.1f}%)에서는 **손절 확률이 더 높았어요**. "
-                        f"승률 **{wr:.0f}%**, 평균 청산수익 **{cur_row['avg_return']:+.1f}%**, "
-                        f"평균 보유 **{cur_row['avg_holding_days']}일** ({rule})"
-                    )
+                    # 승률 색상
+                    wr = row["win_rate"]
+                    if wr >= 60:
+                        wr_cls = "win-high"
+                    elif wr >= 45:
+                        wr_cls = "win-mid"
+                    else:
+                        wr_cls = "win-low"
 
-            # --- 가격 차트 (항상 표시) ---
-            st.markdown("### 📉 가격 vs 200일선")
-            chart_df = df[["Close", "SMA200"]].rename(columns={"Close": "종가", "SMA200": "200일선"})
-            st.line_chart(chart_df)
+                    center_label = f"{row['center']:+.0f}%"
+                    if abs(row["center"]) < 0.01:
+                        center_label = "0% (200일선)"
+
+                    marker = " ◀ 현재" if is_current else ""
+
+                    html += f"""<tr{row_class}>
+                        <td>{center_label}{marker}</td>
+                        <td>{row['zone_label']}</td>
+                        <td>{row['trades']}</td>
+                        <td class="{wr_cls}">{wr:.0f}%</td>
+                        <td>{row['avg_return']:+.1f}%</td>
+                        <td>{row['max_return']:+.1f}%</td>
+                        <td>{row['avg_holding_days']}일</td>
+                    </tr>"""
+
+                html += "</table>"
+                st.markdown(html, unsafe_allow_html=True)
+
+                # --- 현재 위치 결론 ---
+                if cur_zone_idx is not None:
+                    cur_row = result.iloc[cur_zone_idx]
+                    wr = cur_row["win_rate"]
+                    rule = f"목표 +{target_pct:.0f}% / 손절 -{stop_pct:.0f}%, 표본 {cur_row['trades']}건"
+                    st.markdown("---")
+                    if wr >= 60:
+                        st.success(
+                            f"🟢 현재 위치({cur_gap:+.1f}%)에서 매수하면 **목표 도달 확률이 높았어요**. "
+                            f"승률 **{wr:.0f}%**, 평균 청산수익 **{cur_row['avg_return']:+.1f}%**, "
+                            f"평균 보유 **{cur_row['avg_holding_days']}일** ({rule})"
+                        )
+                    elif wr >= 45:
+                        st.warning(
+                            f"🟡 현재 위치({cur_gap:+.1f}%)는 목표·손절이 반반이에요. "
+                            f"승률 **{wr:.0f}%**, 평균 청산수익 **{cur_row['avg_return']:+.1f}%**, "
+                            f"평균 보유 **{cur_row['avg_holding_days']}일** ({rule})"
+                        )
+                    else:
+                        st.error(
+                            f"🔴 현재 위치({cur_gap:+.1f}%)에서는 **손절 확률이 더 높았어요**. "
+                            f"승률 **{wr:.0f}%**, 평균 청산수익 **{cur_row['avg_return']:+.1f}%**, "
+                            f"평균 보유 **{cur_row['avg_holding_days']}일** ({rule})"
+                        )
+
+                # --- 가격 차트 (항상 표시) ---
+                st.markdown("### 📉 가격 vs 200일선")
+                chart_df = df[["Close", "SMA200"]].rename(columns={"Close": "종가", "SMA200": "200일선"})
+                st.line_chart(chart_df)
 
 st.divider()
 st.caption("⚠️ 과거 데이터 기반 통계이며 투자 권유가 아닙니다. 과거 성과가 미래를 보장하지 않습니다.")
