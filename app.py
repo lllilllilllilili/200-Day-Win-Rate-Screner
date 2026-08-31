@@ -1195,10 +1195,14 @@ def render_winzone_catcher():
         best_center = min(zones.keys(), key=lambda c: abs(int(c) - gap))
         wr, samples = zones[best_center]
         if wr >= threshold:
+            mk_emoji = {"US": "🇺🇸", "KR": "🇰🇷", "ALT": "🪙"}.get(v["market"], "")
+            position = "🔴 위" if gap >= 0 else "🟢 아래"
             hits.append({
                 "종목": v["name"],
                 "티커": tk,
-                "시장": "🇺🇸" if v["market"] == "US" else "🇰🇷",
+                "시장": mk_emoji,
+                "200일선": position,
+                "이격": f"{abs(gap):.1f}%",
                 "현재 괴리율": f"{gap:+.1f}%",
                 "매칭 구간": f"{int(best_center):+d}%",
                 "역사적 승률": f"{wr:.0f}%",
