@@ -17,6 +17,12 @@ from datetime import datetime
 
 st.set_page_config(page_title="200일선 승률 스크리너", page_icon="📈", layout="wide")
 
+# 승률 포착기 사전계산 데이터 (없으면 빈 값으로 폴백)
+try:
+    from winzone_data import WINZONE_DATA, WINZONE_META
+except Exception:
+    WINZONE_DATA, WINZONE_META = {}, {"target": 10, "stop": 5, "max_hold": 63, "band": 10, "step": 5}
+
 # ------------------------------------------------------------
 # 즐겨찾기 (URL 쿼리 파라미터에 저장 — 북마크/홈화면 추가로 유지)
 # ------------------------------------------------------------
@@ -1077,6 +1083,84 @@ _MONTH_NAMES = {1:"1월",2:"2월",3:"3월",4:"4월",5:"5월",6:"6월",
                 7:"7월",8:"8월",9:"9월",10:"10월",11:"11월",12:"12월"}
 
 
+def _current_gap(ticker):
+    """현재 200일선 대비 괴리율(%) 반환. 실패 시 None."""
+    r = _ds_status(ticker)
+    return r["gap"] if r else None
+
+
+def render_winzone_catcher():
+    st.subheader("🎯 승률 포착기")
+    st.caption("미장·국장 대형주 200종목 중, 지금 위치가 역사적으로 고승률이었던 종목을 찾아줍니다.")
+
+    if not WINZONE_DATA:
+        st.error("사전 계산 데이터(winzone_data.py)를 찾을 수 없어요.")
+        return
+
+    meta = WINZONE_META
+    st.info(f"📌 **승률 정의**: 목표 **+{meta['target']:.0f}%** / 손절 **-{meta['stop']:.0f}%** "
+            f"(먼저 닿는 쪽), 최대보유 **{meta['max_hold']}거래일(약 3개월)** 기준. "
+            f"현재 200일선 위치와 비슷했던 과거 구간의 승률입니다.")
+
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        threshold = st.selectbox("승률 임계값", [70, 80, 90], index=1,
+                                 format_func=lambda x: f"{x}% 이상",
+                                 help="현재 위치의 역사적 승률이 이 값 이상인 종목만 표시")
+    with c2:
+        market_filter = st.selectbox("시장", ["전체", "미국", "국장"], index=0)
+
+    if not st.button("🔍 승률 포착 스캔", type="primary", key="winzone_scan"):
+        st.info("버튼을 눌러 지금 고승률 구간에 있는 종목을 찾아보세요. "
+                f"(200종목 현재가 확인, 20~40초 소요)")
+        return
+
+    mkmap = {"미국": "US", "국장": "KR"}
+    targets = [(tk, v) for tk, v in WINZONE_DATA.items()
+               if market_filter == "전체" or v["market"] == mkmap.get(market_filter)]
+
+    hits = []
+    prog = st.progress(0.0)
+    total = len(targets)
+    for i, (tk, v) in enumerate(targets):
+        prog.progress((i + 1) / total)
+        gap = _current_gap(tk)
+        if gap is None:
+            continue
+        # 현재 gap에 가장 가까운 center 구간 찾기
+        zones = v["zones"]
+        if not zones:
+            continue
+        best_center = min(zones.keys(), key=lambda c: abs(int(c) - gap))
+        wr, samples = zones[best_center]
+        if wr >= threshold:
+            hits.append({
+                "종목": v["name"],
+                "티커": tk,
+                "시장": "🇺🇸" if v["market"] == "US" else "🇰🇷",
+                "현재 괴리율": f"{gap:+.1f}%",
+                "매칭 구간": f"{int(best_center):+d}%",
+                "역사적 승률": f"{wr:.0f}%",
+                "표본": f"{samples}건",
+                "_wr": wr,
+            })
+    prog.empty()
+
+    if not hits:
+        st.warning(f"지금 승률 {threshold}% 이상 구간에 있는 종목이 없어요. "
+                   "임계값을 낮추거나 나중에 다시 확인해 보세요.")
+        return
+
+    hits.sort(key=lambda x: -x["_wr"])
+    df_hits = pd.DataFrame([{k: v for k, v in h.items() if k != "_wr"} for h in hits])
+    st.success(f"🎯 지금 승률 {threshold}% 이상 구간에 있는 종목: **{len(hits)}개**")
+    st.dataframe(df_hits, use_container_width=True, hide_index=True)
+
+    st.caption("· '매칭 구간'은 현재 괴리율과 가장 가까운 사전계산 구간이에요. "
+               "· 승률은 사전 백테스트(Yahoo Finance 전체 기간) 내장값이며 계산 시점 기준입니다. "
+               "· 표본이 적은 구간은 신뢰도가 낮을 수 있어요. 과거 성과가 미래를 보장하지 않습니다.")
+
+
 def render_sector_rotation():
     st.subheader("🗓️ 미국 섹터 순환매")
     st.caption("11개 미국 섹터 ETF의 월별 계절성 (1999~2026, 약 27년). 몇 월에 어떤 섹터가 강한지.")
@@ -1543,10 +1627,12 @@ with group1:
         render_crypto_screener()
 
 with group2:
-    sub = st.tabs(["📋 데일리 스캐너", "🌡️ 시장 붕괴 경고"])
+    sub = st.tabs(["📋 데일리 스캐너", "🎯 승률 포착기", "🌡️ 시장 붕괴 경고"])
     with sub[0]:
         render_daily_screener()
     with sub[1]:
+        render_winzone_catcher()
+    with sub[2]:
         render_crash_scanner()
 
 with group3:
