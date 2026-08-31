@@ -86,24 +86,30 @@ def zone_winrates(close: np.ndarray):
     return out
 
 
+# 미국 시총 대형주 100 (안정성 위해 하드코딩. yfinance fast_info 시총 조회가 불안정해서)
+US_TOP100_TICKERS = [
+    "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "AVGO", "TSLA", "BRK-B", "LLY",
+    "JPM", "WMT", "V", "MA", "XOM", "ORCL", "UNH", "COST", "HD", "PG",
+    "JNJ", "NFLX", "ABBV", "BAC", "CRM", "CVX", "KO", "AMD", "TMUS", "PEP",
+    "WFC", "LIN", "CSCO", "ACN", "MCD", "ADBE", "IBM", "MRK", "ABT", "GE",
+    "PM", "TXN", "ISRG", "QCOM", "DIS", "CAT", "VZ", "INTU", "GS", "T",
+    "BKNG", "AMGN", "SPGI", "RTX", "NOW", "UBER", "PGR", "MS", "NEE", "HON",
+    "LOW", "UNP", "AMAT", "BLK", "SCHW", "TJX", "SYK", "C", "BSX", "COP",
+    "DHR", "PLD", "VRTX", "ADP", "BA", "MDT", "GILD", "MMC", "ADI", "LRCX",
+    "ETN", "CB", "MU", "KLAC", "AMT", "SBUX", "ANET", "PANW", "INTC", "MO",
+    "SO", "ELV", "ICE", "KKR", "REGN", "DUK", "PYPL", "APH", "CI", "SHW",
+]
+
+
 def get_us_top100():
     import FinanceDataReader as fdr
-    sp = fdr.StockListing("S&P500")
-    tickers = sp["Symbol"].tolist()
-    names = dict(zip(sp["Symbol"], sp["Name"]))
-    # 시총으로 정렬하려면 yfinance 조회 필요 -> 시간 절약 위해 marketCap 배치 조회
-    caps = {}
-    print(f"  미장 시총 조회 중 ({len(tickers)}개)...")
-    for i, tk in enumerate(tickers):
-        try:
-            info = yf.Ticker(tk).fast_info
-            caps[tk] = info.get("market_cap") or 0
-        except Exception:
-            caps[tk] = 0
-        if (i + 1) % 50 == 0:
-            print(f"    {i+1}/{len(tickers)}")
-    top = sorted(tickers, key=lambda t: caps.get(t, 0), reverse=True)[:100]
-    return [(tk, names.get(tk, tk)) for tk in top]
+    names = {}
+    try:
+        sp = fdr.StockListing("S&P500")
+        names = dict(zip(sp["Symbol"], sp["Name"]))
+    except Exception:
+        pass
+    return [(tk, names.get(tk, tk)) for tk in US_TOP100_TICKERS]
 
 
 def get_kr_top100():
@@ -125,14 +131,26 @@ def get_kr_top100():
     return out
 
 
+def get_alts():
+    """주요 알트코인 (앱의 데일리 스캐너 목록과 동일)."""
+    return [
+        ("BTC-USD", "BTC"), ("ETH-USD", "ETH"), ("SOL-USD", "SOL"),
+        ("DOGE-USD", "DOGE"), ("XRP-USD", "XRP"), ("ADA-USD", "ADA"),
+        ("AVAX-USD", "AVAX"), ("LINK-USD", "LINK"), ("BNB-USD", "BNB"),
+    ]
+
+
 def main():
     print("종목 리스트 확보 중...")
     us = get_us_top100()
     kr = get_kr_top100()
-    print(f"  미장 {len(us)}개, 국장 {len(kr)}개")
+    alt = get_alts()
+    print(f"  미장 {len(us)}개, 국장 {len(kr)}개, 알트 {len(alt)}개")
 
-    result = {}  # ticker -> {"name":..., "market":"US"/"KR", "zones": {...}}
-    all_items = [(tk, nm, "US") for tk, nm in us] + [(tk, nm, "KR") for tk, nm in kr]
+    result = {}  # ticker -> {"name":..., "market":"US"/"KR"/"ALT", "zones": {...}}
+    all_items = ([(tk, nm, "US") for tk, nm in us]
+                 + [(tk, nm, "KR") for tk, nm in kr]
+                 + [(tk, nm, "ALT") for tk, nm in alt])
 
     for i, (tk, nm, mk) in enumerate(all_items):
         close = load_close(tk)

@@ -748,6 +748,23 @@ def _best_zone(winrates: dict):
     return z, wr
 
 
+def _winzone_lookup(ticker, gap):
+    """winzone_data에서 현재 gap에 맞는 구간 승률 조회.
+    Returns (현재구간승률str, 최고승률구간str) — 데이터 없으면 ('-','-')."""
+    v = WINZONE_DATA.get(ticker)
+    if not v or not v.get("zones"):
+        return "-", "-"
+    zones = v["zones"]
+    # 현재 gap에 가장 가까운 구간
+    best_center = min(zones.keys(), key=lambda c: abs(int(c) - gap))
+    wr, samp = zones[best_center]
+    cur_str = f"{wr:.0f}% ({samp}건)"
+    # 최고 승률 구간
+    bz = max(zones.items(), key=lambda kv: kv[1][0])
+    best_str = f"{int(bz[0]):+d}% ({bz[1][0]:.0f}%)"
+    return cur_str, best_str
+
+
 def render_kr_winzone():
     st.markdown("#### 🇰🇷 국장 대형주 200일선 매수 전략 스캐너")
     st.caption("'200일선 아래 -N%에서 매수 → 200일선 복귀 시 매도' 전략. "
@@ -833,7 +850,7 @@ def render_kr_winzone():
 def render_us_winzone():
     st.markdown("#### 🇺🇸 미국 대형주 200일선 매수 전략 스캐너")
     st.caption("'200일선 아래로 내려오면 매수 → 복귀 시 매도' 전략. "
-               "복귀 빠른 TOP50 종목의 현재 위치와 역사적 복귀 기간을 함께 봅니다.")
+               "복귀 빠른 TOP50 종목의 현재 위치·구간 승률·복귀 기간을 함께 봅니다.")
 
     # 복귀 빠른 순(평균 복귀일)으로 정렬, 중복 티커 제거
     seen = set()
@@ -861,6 +878,8 @@ def render_us_winzone():
         else:
             guide = "복귀 다소 느림 → 여유 분할 매수"
 
+        cur_wr, best_wr = _winzone_lookup(tk, gap)
+
         if gap < 0:
             # 200일선 아래 = 매수 기회
             if gap <= -10:
@@ -872,8 +891,9 @@ def render_us_winzone():
             below_rows.append({
                 "종목": name,
                 "현재 괴리율": f"{gap:+.1f}%",
+                "구간 승률": cur_wr,
+                "최고 승률 구간": best_wr,
                 "복귀 기간": recov,
-                "최악(최대)": f"{mx}일",
                 "대응": guide,
                 "상태": status,
             })
@@ -881,6 +901,8 @@ def render_us_winzone():
             above_rows.append({
                 "종목": name,
                 "현재 괴리율": f"{gap:+.1f}%",
+                "구간 승률": cur_wr,
+                "최고 승률 구간": best_wr,
                 "복귀 기간": recov,
                 "상태": f"🔵 200일선 위 (+{gap:.1f}%) · 대기",
             })
@@ -914,6 +936,45 @@ def render_us_winzone():
         "느린 종목은 여유 있게 분할 매수할 수 있어요. "
         "복귀 기간은 미국 시총 TOP50 전수 분석 내장값입니다 (Yahoo Finance 전체 기간).</span>",
         unsafe_allow_html=True)
+
+
+def render_alt_winzone():
+    st.markdown("#### 🪙 알트코인 200일선 매수 전략 스캐너")
+    st.caption("주요 알트코인의 현재 200일선 위치와 그 위치의 역사적 승률(목표+10/손절-5, 3개월)을 봅니다.")
+
+    alts = [(tk, v["name"]) for tk, v in WINZONE_DATA.items() if v.get("market") == "ALT"]
+    if not alts:
+        st.info("알트코인 승률 데이터가 없어요.")
+        return
+
+    rows = []
+    for tk, name in alts:
+        r = _ds_status(tk)
+        if not r:
+            continue
+        gap = r["gap"]
+        cur_wr, best_wr = _winzone_lookup(tk, gap)
+        if gap < 0:
+            status = "🟢 매수 구간 (200일선 아래)" if gap <= -5 else "⚪ 200일선 바로 아래"
+        else:
+            status = f"🔵 200일선 위 (+{gap:.1f}%) · 대기"
+        rows.append({
+            "코인": name,
+            "현재 괴리율": f"{gap:+.1f}%",
+            "구간 승률": cur_wr,
+            "최고 승률 구간": best_wr,
+            "상태": status,
+        })
+
+    if not rows:
+        st.warning("데이터를 불러오지 못했어요.")
+        return
+    df = pd.DataFrame(rows)
+    df["_sort"] = df["현재 괴리율"].str.rstrip("%").astype(float)
+    df = df.sort_values("_sort").drop(columns="_sort")
+    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.caption("· '구간 승률'은 현재 괴리율과 가장 가까운 구간의 역사적 승률(표본수)이에요. "
+               "· 코인은 변동성이 커서 표본·승률 해석에 주의하세요. 과거 성과가 미래를 보장하지 않습니다.")
 
 
 def render_favorites_section():
@@ -1341,6 +1402,10 @@ def render_daily_screener():
         st.markdown("#### 🪙 알트코인")
         st.dataframe(_ds_table([(t, t.replace("-USD", "")) for t in _DS_ALT]),
                      use_container_width=True, hide_index=True)
+
+    with st.spinner("알트코인 승률 스캔 중..."):
+        st.markdown("---")
+        render_alt_winzone()
 
     st.caption("⚠️ 과거 데이터 기반이며 투자 권유가 아닙니다. BUY/SELL은 200일선 돌파/이탈 신호일 뿐입니다.")
 
