@@ -645,6 +645,16 @@ def render_crash_scanner():
 # ============================================================
 _DS_INDICES = {'QQQ': '나스닥100', 'SPY': 'S&P500', '069500.KS': '코스피(ETF)'}
 _DS_US_TIER1 = ['NVDA', 'META', 'GOOGL', 'AAPL', 'CRM', 'MA', 'CSCO']
+
+# 주요 지수·레버리지 ETF 200일선 스캔 목록 (티커: 이름)
+_DS_LEV_INDICES = {
+    '^KS11': '코스피 지수', '^KQ11': '코스닥 지수',
+    '^IXIC': '나스닥 종합', '^GSPC': 'S&P500 지수',
+    'QQQ': '나스닥100(QQQ)', 'SOXX': '반도체(SOXX)',
+    'TQQQ': 'TQQQ(나스닥100 3x)', 'SOXL': 'SOXL(반도체 3x)',
+    'KORU': 'KORU(한국 3x)', 'GDXU': 'GDXU(금광 2x)',
+    'BTC-USD': 'BTC(비트코인)', 'ETH-USD': 'ETH(이더리움)',
+}
 _DS_ALT = ['ETH-USD', 'SOL-USD', 'DOGE-USD', 'XRP-USD', 'ADA-USD', 'AVAX-USD', 'LINK-USD', 'BNB-USD']
 _DS_KR = {
     '005930.KS': '삼성전자', '000660.KS': 'SK하이닉스', '005380.KS': '현대차',
@@ -1381,9 +1391,10 @@ def render_daily_screener():
         st.info("버튼을 눌러 오늘의 200일선 상태를 스캔하세요. (종목이 많아 20~40초 걸릴 수 있어요)")
         return
 
-    with st.spinner("지수 스캔 중..."):
-        st.markdown("#### 📊 지수")
-        st.dataframe(_ds_table(list(_DS_INDICES.items())), use_container_width=True, hide_index=True)
+    with st.spinner("지수·레버리지 ETF 스캔 중..."):
+        st.markdown("#### 📊 주요 지수 · 레버리지 ETF 200일선")
+        st.caption("주요 지수와 레버리지 ETF가 200일선을 뚫었는지(위/아래·돌파·이탈) 한눈에.")
+        st.dataframe(_ds_table(list(_DS_LEV_INDICES.items())), use_container_width=True, hide_index=True)
 
     with st.spinner("미국 대형주 스캔 중..."):
         st.markdown("#### 🇺🇸 미국 주요주")
