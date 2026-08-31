@@ -1904,12 +1904,15 @@ with tab1:
 
                 st.markdown(f"### 📊 [핵심] 200일선 대비 위치별 승률")
                 st.markdown(f"폭 {band_width}%, 완충 {step}%, 목표 +{target_pct:.0f}% / 손절 -{stop_pct:.0f}% "
-                            f"(먼저 닿는 쪽), 최대보유 {max_hold_choice} 기준 전수조사 결과:")
+                            f"(먼저 닿는 쪽), 최대보유 {max_hold_choice} 기준 전수조사 결과:  \n"
+                            f"<span style='color:gray'>· '해당 가격'은 현재 200일선({cur_sma:,.2f}) 기준으로 "
+                            f"그 위치가 되려면 얼마여야 하는지예요.</span>", unsafe_allow_html=True)
 
                 # HTML 테이블 생성
                 html = '<table class="position-table">'
                 html += """<tr>
                     <th>중심 위치</th>
+                    <th>해당 가격</th>
                     <th>구간</th>
                     <th>거래수</th>
                     <th>승률</th>
@@ -1937,8 +1940,12 @@ with tab1:
 
                     marker = " ◀ 현재" if is_current else ""
 
+                    # 중심 위치에 해당하는 가격 = 현재 200일선 × (1 + center%/100)
+                    zone_price = cur_sma * (1 + row["center"] / 100)
+
                     html += f"""<tr{row_class}>
                         <td>{center_label}{marker}</td>
+                        <td>{zone_price:,.2f}</td>
                         <td>{row['zone_label']}</td>
                         <td>{row['trades']}</td>
                         <td class="{wr_cls}">{wr:.0f}%</td>
