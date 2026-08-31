@@ -1165,7 +1165,7 @@ def render_winzone_catcher():
 
     c1, c2 = st.columns([1, 1])
     with c1:
-        threshold = st.selectbox("승률 임계값", [70, 80, 90], index=1,
+        threshold = st.selectbox("승률 임계값", [59, 60, 70, 80, 90, 100], index=3,
                                  format_func=lambda x: f"{x}% 이상",
                                  help="현재 위치의 역사적 승률이 이 값 이상인 종목만 표시")
     with c2:
