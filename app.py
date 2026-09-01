@@ -1820,7 +1820,7 @@ with tab1:
         band_width = st.selectbox("구간 폭", [5, 10, 15, 20], index=1,
                                   help="한 구간이 커버하는 범위 (예: 10%면 중심±5%)")
     with c_c:
-        step = st.selectbox("중심 간격 (완충)", [1, 2, 5, 10], index=2,
+        step = st.selectbox("중심 간격 (완충)", [1, 2, 5, 10], index=1,
                             help="행을 얼마나 촘촘히 찍을지. 구간 폭보다 작으면 구간이 겹칩니다(슬라이딩).")
 
     c1, c2, c3 = st.columns(3)
