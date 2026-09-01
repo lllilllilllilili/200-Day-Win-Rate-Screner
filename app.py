@@ -995,6 +995,44 @@ def render_alt_winzone():
                "· 코인은 변동성이 커서 표본·승률 해석에 주의하세요. 과거 성과가 미래를 보장하지 않습니다.")
 
 
+def render_fxb_winzone():
+    st.markdown("#### 💱 환율 · 국채 200일선 승률 스캐너")
+    st.caption("환율·국채의 현재 200일선 위치와 그 위치의 역사적 승률(목표+10/손절-5, 3개월)을 봅니다.  \n"
+               "⚠️ 환율·국채는 주식과 성격이 달라요. '승률'은 이 위치에서 +10% 오를 확률이에요 "
+               "(환율 '위'=달러 강세 지속, 채권 ETF '위'=채권가격 상승 지속).")
+
+    fxbs = [(tk, v["name"]) for tk, v in WINZONE_DATA.items() if v.get("market") == "FXB"]
+    if not fxbs:
+        st.info("환율·국채 승률 데이터가 없어요.")
+        return
+
+    rows = []
+    for tk, name in fxbs:
+        r = _ds_status(tk)
+        if not r:
+            continue
+        gap = r["gap"]
+        cur_wr, best_wr = _winzone_lookup(tk, gap)
+        status = "🔵 200일선 위" if gap >= 0 else "🟢 200일선 아래"
+        rows.append({
+            "종목": name,
+            "현재 괴리율": f"{gap:+.1f}%",
+            "구간 승률": cur_wr,
+            "최고 승률 구간": best_wr,
+            "상태": status,
+        })
+
+    if not rows:
+        st.warning("데이터를 불러오지 못했어요.")
+        return
+    df = pd.DataFrame(rows)
+    df["_sort"] = df["현재 괴리율"].str.rstrip("%").astype(float)
+    df = df.sort_values("_sort").drop(columns="_sort")
+    st.dataframe(df, use_container_width=True, hide_index=True)
+    st.caption("· 표본이 적은 구간(달러인덱스·단기채 등)은 신뢰도가 낮을 수 있어요. "
+               "과거 성과가 미래를 보장하지 않습니다.")
+
+
 def render_favorites_section():
     """즐겨찾기한 종목들의 현재 200일선 상태 표시."""
     favs = get_favorites()
@@ -1187,14 +1225,14 @@ def render_winzone_catcher():
                                  format_func=lambda x: f"{x}% 이상",
                                  help="현재 위치의 역사적 승률이 이 값 이상인 종목만 표시")
     with c2:
-        market_filter = st.selectbox("시장", ["전체", "미국", "국장"], index=0)
+        market_filter = st.selectbox("시장", ["전체", "미국", "국장", "알트", "환율/국채"], index=0)
 
     if not st.button("🔍 승률 포착 스캔", type="primary", key="winzone_scan"):
         st.info("버튼을 눌러 지금 고승률 구간에 있는 종목을 찾아보세요. "
-                f"(200종목 현재가 확인, 20~40초 소요)")
+                f"(200종목+ 현재가 확인, 20~40초 소요)")
         return
 
-    mkmap = {"미국": "US", "국장": "KR"}
+    mkmap = {"미국": "US", "국장": "KR", "알트": "ALT", "환율/국채": "FXB"}
     targets = [(tk, v) for tk, v in WINZONE_DATA.items()
                if market_filter == "전체" or v["market"] == mkmap.get(market_filter)]
 
@@ -1213,7 +1251,7 @@ def render_winzone_catcher():
         best_center = min(zones.keys(), key=lambda c: abs(int(c) - gap))
         wr, samples = zones[best_center]
         if wr >= threshold:
-            mk_emoji = {"US": "🇺🇸", "KR": "🇰🇷", "ALT": "🪙"}.get(v["market"], "")
+            mk_emoji = {"US": "🇺🇸", "KR": "🇰🇷", "ALT": "🪙", "FXB": "💱"}.get(v["market"], "")
             position = "🔴 위" if gap >= 0 else "🟢 아래"
             hits.append({
                 "종목": v["name"],
@@ -1409,6 +1447,11 @@ def render_daily_screener():
         st.caption("달러/원·달러/엔 환율과 미국채(가격·금리)의 200일선 대비 괴리율. "
                    "환율 '위'=원화·엔화 약세, 국채 ETF '아래'=채권가격 하락(금리 상승).")
         st.dataframe(_ds_table(list(_DS_FX_BOND.items())), use_container_width=True, hide_index=True)
+
+    with st.spinner("환율·국채 승률 스캔 중..."):
+        st.markdown("---")
+        render_fxb_winzone()
+        st.markdown("---")
 
     with st.spinner("미국 대형주 스캔 중..."):
         st.markdown("#### 🇺🇸 미국 주요주")

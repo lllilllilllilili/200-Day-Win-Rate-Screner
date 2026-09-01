@@ -140,17 +140,33 @@ def get_alts():
     ]
 
 
+def get_fx_bond():
+    """환율·국채 (앱의 _DS_FX_BOND 목록과 동일)."""
+    return [
+        ("KRW=X",     "달러/원(USDKRW)"),
+        ("JPY=X",     "달러/엔(USDJPY)"),
+        ("DX-Y.NYB",  "달러인덱스(DXY)"),
+        ("SHY",       "미국채1-3년(SHY)"),
+        ("IEF",       "미국채7-10년(IEF)"),
+        ("TLT",       "미국채20년+(TLT)"),
+        ("^TNX",      "미국채10년금리"),
+        ("^TYX",      "미국채30년금리"),
+    ]
+
+
 def main():
     print("종목 리스트 확보 중...")
     us = get_us_top100()
     kr = get_kr_top100()
     alt = get_alts()
-    print(f"  미장 {len(us)}개, 국장 {len(kr)}개, 알트 {len(alt)}개")
+    fxb = get_fx_bond()
+    print(f"  미장 {len(us)}개, 국장 {len(kr)}개, 알트 {len(alt)}개, 환율/국채 {len(fxb)}개")
 
-    result = {}  # ticker -> {"name":..., "market":"US"/"KR"/"ALT", "zones": {...}}
+    result = {}
     all_items = ([(tk, nm, "US") for tk, nm in us]
                  + [(tk, nm, "KR") for tk, nm in kr]
-                 + [(tk, nm, "ALT") for tk, nm in alt])
+                 + [(tk, nm, "ALT") for tk, nm in alt]
+                 + [(tk, nm, "FXB") for tk, nm in fxb])
 
     for i, (tk, nm, mk) in enumerate(all_items):
         close = load_close(tk)
