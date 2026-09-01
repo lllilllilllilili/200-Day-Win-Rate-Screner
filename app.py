@@ -17,9 +17,14 @@ from datetime import datetime
 
 st.set_page_config(page_title="200일선 승률 스크리너", page_icon="📈", layout="wide")
 
-# 승률 포착기 사전계산 데이터 (없으면 빈 값으로 폴백)
+# 승률 포착기 사전계산 데이터 (JSON 로딩 — .py 파싱보다 가볍고 안정적)
 try:
-    from winzone_data import WINZONE_DATA, WINZONE_META
+    import json as _wz_json, os as _wz_os
+    _wz_path = _wz_os.path.join(_wz_os.path.dirname(__file__), "winzone_data.json")
+    with open(_wz_path, encoding="utf-8") as _wz_f:
+        _wz = _wz_json.load(_wz_f)
+    WINZONE_DATA = _wz["data"]
+    WINZONE_META = _wz["meta"]
 except Exception:
     WINZONE_DATA, WINZONE_META = {}, {"target": 10, "stop": 5, "max_hold": 63, "band": 10, "step": 5}
 

@@ -179,7 +179,7 @@ def main():
         print(f"  [{i+1}/{len(all_items)}] {tk} {nm}: 구간 {len(zones)}개")
         time.sleep(0.05)
 
-    # winzone_data.py 로 저장
+    # winzone_data.py 로 저장 (호환성 유지)
     with open("winzone_data.py", "w", encoding="utf-8") as f:
         f.write('"""승률 포착기 사전 계산 데이터 (precompute_winzone.py 로 생성).\n')
         f.write(f'기준: 목표+{TARGET_PCT:.0f}% / 손절-{STOP_PCT:.0f}% / 최대보유 {MAX_HOLD}거래일\n')
@@ -189,7 +189,16 @@ def main():
         f.write("WINZONE_DATA = ")
         f.write(json.dumps(result, ensure_ascii=False, indent=0))
         f.write("\n")
-    print(f"\n완료: {len(result)}개 종목 -> winzone_data.py")
+
+    # winzone_data.json 으로도 저장 (앱은 이걸 사용 — 로딩이 가볍고 안정적)
+    payload = {
+        "meta": {"target": TARGET_PCT, "stop": STOP_PCT, "max_hold": MAX_HOLD,
+                 "band": BAND_WIDTH, "step": STEP},
+        "data": result,
+    }
+    with open("winzone_data.json", "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, separators=(',', ':'))
+    print(f"\n완료: {len(result)}개 종목 -> winzone_data.py + winzone_data.json")
 
 
 if __name__ == "__main__":
