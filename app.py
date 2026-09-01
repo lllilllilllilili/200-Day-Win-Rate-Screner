@@ -510,7 +510,6 @@ def render_crypto_screener():
     table = pd.DataFrame([{
         "자산": r["자산"],
         "현재가": f"{r['현재가']:,.2f}",
-        "200일선": f"{r['200일선']:,.2f}",
         "괴리율": f"{r['괴리율']:+.1f}%",
         "위/아래": r["위/아래"],
         "매도선(6%완충)": f"{r['매도선']:,.2f}",
@@ -655,6 +654,15 @@ _DS_LEV_INDICES = {
     'KORU': 'KORU(한국 3x)', 'GDXU': 'GDXU(금광 2x)',
     'BTC-USD': 'BTC(비트코인)', 'ETH-USD': 'ETH(이더리움)',
 }
+
+# 환율·국채 200일선 스캔 목록 (티커: 이름)
+_DS_FX_BOND = {
+    'KRW=X': '달러/원 (USDKRW)', 'JPY=X': '달러/엔 (USDJPY)',
+    'DX-Y.NYB': '달러인덱스 (DXY)',
+    'SHY': '미국채 1-3년 (SHY)', 'IEF': '미국채 7-10년 (IEF)',
+    'TLT': '미국채 20년+ (TLT)',
+    '^TNX': '미국채 10년 금리', '^TYX': '미국채 30년 금리',
+}
 _DS_ALT = ['ETH-USD', 'SOL-USD', 'DOGE-USD', 'XRP-USD', 'ADA-USD', 'AVAX-USD', 'LINK-USD', 'BNB-USD']
 _DS_KR = {
     '005930.KS': '삼성전자', '000660.KS': 'SK하이닉스', '005380.KS': '현대차',
@@ -697,7 +705,7 @@ def _ds_table(items):
         if not r:
             continue
         rows.append({
-            "종목": name, "종가": f"{r['close']:,.2f}", "200SMA": f"{r['ma']:,.2f}",
+            "종목": name, "종가": f"{r['close']:,.2f}",
             "괴리율": f"{r['gap']:+.1f}%", "위/아래": "위" if r["above"] else "아래",
             "신호": r["signal"],
         })
@@ -1001,11 +1009,11 @@ def render_favorites_section():
         ticker, name = f.get("ticker"), f.get("name", f.get("ticker"))
         r = _ds_status(ticker)
         if not r:
-            rows.append({"종목": name, "종가": "-", "200SMA": "-",
+            rows.append({"종목": name, "종가": "-",
                          "괴리율": "-", "위/아래": "-", "신호": "데이터 없음"})
             continue
         rows.append({
-            "종목": name, "종가": f"{r['close']:,.2f}", "200SMA": f"{r['ma']:,.2f}",
+            "종목": name, "종가": f"{r['close']:,.2f}",
             "괴리율": f"{r['gap']:+.1f}%", "위/아래": "위" if r["above"] else "아래",
             "신호": r["signal"],
         })
@@ -1267,7 +1275,7 @@ def render_sector_rotation():
                     stt = r["signal"]
                 rows.append({
                     "섹터": name, "ETF": tk,
-                    "현재가": f"{r['close']:,.2f}", "200일선": f"{r['ma']:,.2f}",
+                    "현재가": f"{r['close']:,.2f}",
                     "괴리율": f"{r['gap']:+.1f}%", "상태": stt,
                 })
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
@@ -1395,6 +1403,12 @@ def render_daily_screener():
         st.markdown("#### 📊 주요 지수 · 레버리지 ETF 200일선")
         st.caption("주요 지수와 레버리지 ETF가 200일선을 뚫었는지(위/아래·돌파·이탈) 한눈에.")
         st.dataframe(_ds_table(list(_DS_LEV_INDICES.items())), use_container_width=True, hide_index=True)
+
+    with st.spinner("환율·국채 스캔 중..."):
+        st.markdown("#### 💱 환율 · 국채 200일선")
+        st.caption("달러/원·달러/엔 환율과 미국채(가격·금리)의 200일선 대비 괴리율. "
+                   "환율 '위'=원화·엔화 약세, 국채 ETF '아래'=채권가격 하락(금리 상승).")
+        st.dataframe(_ds_table(list(_DS_FX_BOND.items())), use_container_width=True, hide_index=True)
 
     with st.spinner("미국 대형주 스캔 중..."):
         st.markdown("#### 🇺🇸 미국 주요주")
@@ -1528,7 +1542,7 @@ def render_rotation():
                     stt = "🔴 200일선 아래 (제외)"
                 rows.append({
                     "우선순위": a["prio"], "종목": a["name"],
-                    "현재가": f"{s['price']:,.2f}", "200일선": f"{s['sma']:,.2f}",
+                    "현재가": f"{s['price']:,.2f}",
                     "괴리율": f"{s['gap']:+.1f}%", "상태": stt,
                 })
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
