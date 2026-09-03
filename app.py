@@ -2375,8 +2375,16 @@ with tab1:
                 # 현재 위치 = center가 현재 괴리율에 가장 가까운 구간
                 # (슬라이딩이라 현재 gap을 포함하는 구간이 여럿일 수 있음)
                 cur_zone_idx = int((result["center"] - cur_gap).abs().idxmin())
+                cur_center = float(result.iloc[cur_zone_idx]["center"])
 
                 st.markdown(f"### 📊 [핵심] 200일선 대비 위치별 승률")
+                # 현재 위치가 표의 매칭 구간에서 멀면(±완충폭 초과) 별도 안내
+                if abs(cur_center - cur_gap) > max(step, band_width / 2):
+                    st.warning(
+                        f"⚠️ 현재 괴리율(**{cur_gap:+.1f}%**)이 과거 표본이 있는 구간을 벗어났어요. "
+                        f"이 종목이 역사적으로 이 위치까지 온 적이 드물어서, 가장 가까운 "
+                        f"**{cur_center:+.0f}%** 구간(표본 {int(result.iloc[cur_zone_idx]['trades'])}건)으로 표시합니다. "
+                        f"참고용으로만 보세요.")
                 st.markdown(f"폭 {band_width}%, 완충 {step}%, 목표 +{target_pct:.0f}% / 손절 -{stop_pct:.0f}% "
                             f"(먼저 닿는 쪽), 최대보유 {max_hold_choice} 기준 전수조사 결과:  \n"
                             f"<span style='color:gray'>· '해당 가격'은 현재 200일선({cur_sma:,.2f}) 기준 그 위치 가격이에요. "
