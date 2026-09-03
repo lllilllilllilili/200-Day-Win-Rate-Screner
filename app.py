@@ -732,6 +732,104 @@ def _ds_status(ticker):
             "signal": signal, "rsi": rsi}
 
 
+@st.cache_data(ttl=3600, show_spinner=False, max_entries=60)
+def get_fundamentals(ticker):
+    """단일 종목의 밸류에이션+재무건전성 지표를 yfinance .info에서 실시간 조회.
+    Returns dict 또는 None. 코인/지수 등 지표 없으면 대부분 None 필드."""
+    try:
+        info = yf.Ticker(ticker).info
+    except Exception:
+        return None
+
+    def num(*keys):
+        for k in keys:
+            v = info.get(k)
+            if isinstance(v, (int, float)) and v == v:  # not NaN
+                return float(v)
+        return None
+
+    per = num("trailingPE", "forwardPE")
+    pbr = num("priceToBook")
+    psr = num("priceToSalesTrailing12Months")
+    roe = num("returnOnEquity")            # 소수 (0.15 = 15%)
+    dte = num("debtToEquity")              # % 또는 배수 (yfinance는 보통 % 단위, 예: 150 = 150%)
+    opm = num("operatingMargins")          # 소수 (0.25 = 25%)
+    return {"per": per, "pbr": pbr, "psr": psr, "roe": roe, "dte": dte, "opm": opm}
+
+
+def _fmt_valuation(f):
+    """밸류에이션 판단 (PER/PBR/PSR 절대 기준). (요약라벨, 상세리스트) 반환."""
+    if not f:
+        return "-", []
+    details = []
+    flags = []  # 고평가 신호 개수
+    per, pbr, psr = f.get("per"), f.get("pbr"), f.get("psr")
+    if per is not None:
+        tag = "🔴높음" if per >= 30 else ("🟡보통" if per >= 15 else "🟢낮음")
+        if per >= 30:
+            flags.append(1)
+        details.append(("PER", f"{per:.1f}", tag))
+    if pbr is not None:
+        tag = "🔴높음" if pbr >= 5 else ("🟡보통" if pbr >= 1.5 else "🟢낮음")
+        if pbr >= 5:
+            flags.append(1)
+        details.append(("PBR", f"{pbr:.2f}", tag))
+    if psr is not None:
+        tag = "🔴높음" if psr >= 10 else ("🟡보통" if psr >= 3 else "🟢낮음")
+        if psr >= 10:
+            flags.append(1)
+        details.append(("PSR", f"{psr:.2f}", tag))
+    if not details:
+        return "-", []
+    if len(flags) >= 2:
+        summary = "🔴 고평가 경향"
+    elif len(flags) == 1:
+        summary = "🟡 일부 고평가"
+    else:
+        summary = "🟢 부담 적음"
+    return summary, details
+
+
+def _fmt_health(f):
+    """재무건전성 판단 (ROE/부채비율/영업이익률). (요약라벨, 상세리스트) 반환."""
+    if not f:
+        return "-", []
+    details = []
+    good = 0
+    total = 0
+    roe, dte, opm = f.get("roe"), f.get("dte"), f.get("opm")
+    if roe is not None:
+        total += 1
+        pct = roe * 100
+        tag = "🟢우수" if pct >= 15 else ("🟡보통" if pct >= 5 else "🔴낮음")
+        if pct >= 15:
+            good += 1
+        details.append(("ROE", f"{pct:.1f}%", tag))
+    if dte is not None:
+        total += 1
+        # yfinance debtToEquity는 % 단위(예: 150 = 부채/자본 150%)
+        tag = "🟢낮음" if dte < 100 else ("🟡보통" if dte < 200 else "🔴높음")
+        if dte < 100:
+            good += 1
+        details.append(("부채비율", f"{dte:.0f}%", tag))
+    if opm is not None:
+        total += 1
+        pct = opm * 100
+        tag = "🟢우수" if pct >= 20 else ("🟡보통" if pct >= 8 else "🔴낮음")
+        if pct >= 20:
+            good += 1
+        details.append(("영업이익률", f"{pct:.1f}%", tag))
+    if total == 0:
+        return "-", []
+    if good >= 2:
+        summary = "🟢 건전"
+    elif good == 1:
+        summary = "🟡 보통"
+    else:
+        summary = "🔴 주의"
+    return summary, details
+
+
 def _fmt_rsi(rsi):
     """RSI 값을 상태 라벨과 함께 문자열로. (과매도<30, 과매수>70)"""
     if rsi is None:
@@ -2150,6 +2248,37 @@ with tab1:
                     add_favorite(fav_ticker, display_name)
                     st.rerun()
                 st.caption("☆ 추가하면 데일리 스캐너 탭에서 모아볼 수 있어요.")
+
+            # --- 밸류에이션 · 재무건전성 (실시간) ---
+            with st.spinner("재무 지표 조회 중..."):
+                fund = get_fundamentals(fav_ticker)
+            val_summary, val_details = _fmt_valuation(fund)
+            health_summary, health_details = _fmt_health(fund)
+
+            if val_details or health_details:
+                st.markdown("#### 💼 밸류에이션 · 재무건전성")
+                fcol1, fcol2 = st.columns(2)
+                with fcol1:
+                    st.markdown(f"**고평가 여부: {val_summary}**")
+                    if val_details:
+                        st.dataframe(
+                            pd.DataFrame(val_details, columns=["지표", "값", "판단"]),
+                            use_container_width=True, hide_index=True)
+                    else:
+                        st.caption("밸류에이션 지표 없음 (코인/지수 등)")
+                with fcol2:
+                    st.markdown(f"**재무건전성: {health_summary}**")
+                    if health_details:
+                        st.dataframe(
+                            pd.DataFrame(health_details, columns=["지표", "값", "판단"]),
+                            use_container_width=True, hide_index=True)
+                    else:
+                        st.caption("재무 지표 없음 (코인/지수/일부 종목)")
+                st.caption("· PER≥30·PBR≥5·PSR≥10 = 높음(고평가 신호). "
+                           "· ROE≥15%·부채비율<100%·영업이익률≥20% = 우수. "
+                           "yfinance 실시간 값이며 결측일 수 있어요. 투자 권유가 아닙니다.")
+            else:
+                st.caption("💼 이 종목은 밸류에이션·재무 지표를 제공하지 않아요 (코인/지수/환율 등).")
             st.markdown(f"🎯 목표 **+{target_pct:.0f}%** / 🛑 손절 **-{stop_pct:.0f}%** | "
                         f"최대보유: **{max_hold_choice}** | "
                         f"구간 폭: **{band_width}%** / 완충: **{step}%**")
