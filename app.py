@@ -96,6 +96,7 @@ st.markdown("""
 <style>
 .position-wrap {
     overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
     border-radius: 10px;
     border: 1px solid #2b2f36;
     margin-top: 14px;
@@ -116,8 +117,6 @@ st.markdown("""
     font-weight: 600;
     font-size: 12px;
     line-height: 1.35;
-    position: sticky;
-    top: 0;
 }
 .position-table td {
     padding: 8px 10px;
