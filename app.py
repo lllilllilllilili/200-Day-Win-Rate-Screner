@@ -353,6 +353,7 @@ def zone_analysis(df: pd.DataFrame, band_width: float, step: float,
     """
     close = df["Close"].values
     gap = df["gap"].values
+    sma = df["SMA200"].values
     n = len(close)
     half = band_width / 2
 
@@ -363,6 +364,9 @@ def zone_analysis(df: pd.DataFrame, band_width: float, step: float,
     max_ret = np.full(n, np.nan)    # 보유 중 최대 도달 수익률(%)
     hold_day = np.zeros(n, dtype=np.int32)
     win = np.zeros(n, dtype=bool)
+    # 200일선 복귀 방식 (200일선 아래 진입만): max_hold 내 종가가 200일선 위로 복귀하면 승리
+    sma_win = np.zeros(n, dtype=bool)
+    sma_has = np.zeros(n, dtype=bool)
 
     for pos in range(n - 1):
         entry = close[pos]
@@ -389,6 +393,12 @@ def zone_analysis(df: pd.DataFrame, band_width: float, step: float,
             exit_ret[pos] = final
             hold_day[pos] = path.size
 
+        # 200일선 복귀 (진입 시점이 200일선 아래일 때만)
+        if gap[pos] <= -3:
+            fut_sma = sma[pos + 1:end + 1]
+            sma_has[pos] = True
+            sma_win[pos] = bool((path > fut_sma).any())
+
     valid = ~np.isnan(exit_ret)  # 결과가 있는 진입 시점
 
     # --- 2단계: 슬라이딩 구간별로 인덱싱 집계 ---
@@ -407,6 +417,13 @@ def zone_analysis(df: pd.DataFrame, band_width: float, step: float,
         trades = int(sel.sum())
         if trades == 0:
             continue
+        # 200일선 복귀 승률 (이 구간에서 200일선 아래 진입 표본이 있을 때만)
+        sma_sel = sma_has & (gap >= lo) & (gap < hi)
+        sma_n = int(sma_sel.sum())
+        if sma_n > 0:
+            sma_wr = float(sma_win[sma_sel].mean() * 100)
+        else:
+            sma_wr = None
         rows.append({
             "center": center,
             "zone_label": f"{fmt(lo)}%~{fmt(hi)}%",
@@ -415,6 +432,8 @@ def zone_analysis(df: pd.DataFrame, band_width: float, step: float,
             "avg_return": float(exit_ret[sel].mean()),
             "max_return": float(np.nanmean(max_ret[sel])),
             "avg_holding_days": int(round(hold_day[sel].mean())),
+            "sma_win_rate": sma_wr,
+            "sma_trades": sma_n,
         })
 
     return pd.DataFrame(rows)
@@ -2092,8 +2111,10 @@ with tab1:
                 st.markdown(f"### 📊 [핵심] 200일선 대비 위치별 승률")
                 st.markdown(f"폭 {band_width}%, 완충 {step}%, 목표 +{target_pct:.0f}% / 손절 -{stop_pct:.0f}% "
                             f"(먼저 닿는 쪽), 최대보유 {max_hold_choice} 기준 전수조사 결과:  \n"
-                            f"<span style='color:gray'>· '해당 가격'은 현재 200일선({cur_sma:,.2f}) 기준으로 "
-                            f"그 위치가 되려면 얼마여야 하는지예요.</span>", unsafe_allow_html=True)
+                            f"<span style='color:gray'>· '해당 가격'은 현재 200일선({cur_sma:,.2f}) 기준 그 위치 가격이에요. "
+                            f"· 승률(목표/손절) = +{target_pct:.0f}% 익절 vs -{stop_pct:.0f}% 손절. "
+                            f"· 승률(200선복귀) = 200일선 아래에서 매수 후 {max_hold_choice} 내 200일선 위로 복귀하면 승리 "
+                            f"(200일선 아래 구간만 값이 있어요).</span>", unsafe_allow_html=True)
 
                 # HTML 테이블 생성
                 html = '<table class="position-table">'
@@ -2102,7 +2123,8 @@ with tab1:
                     <th>해당 가격</th>
                     <th>구간</th>
                     <th>거래수</th>
-                    <th>승률</th>
+                    <th>승률<br><span style="font-size:11px;color:#888">목표/손절</span></th>
+                    <th>승률<br><span style="font-size:11px;color:#888">200선복귀</span></th>
                     <th>평균 수익</th>
                     <th>최대 수익</th>
                     <th>평균 보유</th>
@@ -2130,12 +2152,21 @@ with tab1:
                     # 중심 위치에 해당하는 가격 = 현재 200일선 × (1 + center%/100)
                     zone_price = cur_sma * (1 + row["center"] / 100)
 
+                    # 200일선 복귀 승률 (아래 구간만 값 있음)
+                    swr = row.get("sma_win_rate")
+                    if swr is None or (isinstance(swr, float) and pd.isna(swr)):
+                        sma_cell = '<span style="color:#555">-</span>'
+                    else:
+                        s_cls = "win-high" if swr >= 60 else ("win-mid" if swr >= 45 else "win-low")
+                        sma_cell = f'<span class="{s_cls}">{swr:.0f}%</span>'
+
                     html += f"""<tr{row_class}>
                         <td>{center_label}{marker}</td>
                         <td>{zone_price:,.2f}</td>
                         <td>{row['zone_label']}</td>
                         <td>{row['trades']}</td>
                         <td class="{wr_cls}">{wr:.0f}%</td>
+                        <td>{sma_cell}</td>
                         <td>{row['avg_return']:+.1f}%</td>
                         <td>{row['max_return']:+.1f}%</td>
                         <td>{row['avg_holding_days']}일</td>
