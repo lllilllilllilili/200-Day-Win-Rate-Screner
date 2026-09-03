@@ -631,6 +631,16 @@ def _crash_indicators():
         out.append(("하이일드 스프레드", f"{bp:.0f}bp", stt, score,
                     "500bp+ 확대 = 신용시장 공포, 주식보다 2~4주 선행"))
 
+    # 소비자 신뢰지수 (FRED UMCSENT, 침체 선행)
+    conf = _consumer_confidence()
+    if conf is not None:
+        if conf < 55: score, stt = 85, "점등"
+        elif conf < 70: score, stt = 50, "경계"
+        elif conf < 90: score, stt = 25, "정상"
+        else: score, stt = 10, "정상"
+        out.append(("소비자 신뢰지수 (미시건대)", f"{conf:.1f}", stt, score,
+                    "55↓ = 역사적 저점(침체 선행). 소비=GDP 70%"))
+
     return out
 
 
@@ -642,6 +652,20 @@ def _hy_spread():
         from datetime import datetime as _dt, timedelta as _td
         df = web.DataReader("BAMLH0A0HYM2", "fred",
                             _dt.now() - _td(days=30), _dt.now())
+        df = df.dropna()
+        return float(df.iloc[-1, 0]) if len(df) else None
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=86400, show_spinner=False, max_entries=1)
+def _consumer_confidence():
+    """FRED 미시건대 소비자심리지수(UMCSENT) 최근값. 실패 시 None. (월간 데이터)"""
+    try:
+        import pandas_datareader.data as web
+        from datetime import datetime as _dt, timedelta as _td
+        df = web.DataReader("UMCSENT", "fred",
+                            _dt.now() - _td(days=200), _dt.now())
         df = df.dropna()
         return float(df.iloc[-1, 0]) if len(df) else None
     except Exception:
@@ -700,8 +724,7 @@ def render_crash_scanner():
 | **버핏 지표** (시총/GDP) | 200%↑ 위험 (장기평균 88%) | [gurufocus](https://www.gurufocus.com/stock-market-valuations.php) |
 | **쉴러 CAPE** | 30↑ 고평가, 40↑ 닷컴급 | [multpl](https://www.multpl.com/shiller-pe) |
 | **내부자 매도** | 여러 기업 동시 대량 매도(클러스터) | [openinsider](http://openinsider.com) |
-| **ISM 제조업 PMI** | 50 하회 (특히 45↓) | [FRED MANEMP](https://fred.stlouisfed.org/series/MANEMP) |
-| **소비자 신뢰지수** | 전월비 -10%↑ 급락 | [FRED UMCSENT](https://fred.stlouisfed.org/series/UMCSENT) |
+| **ISM 제조업 PMI** | 50 하회 (특히 45↓) | [ISM](https://www.ismworld.org/supply-management-news-and-reports/reports/ism-report-on-business/) |
 | **마진 부채** | 사상 최고 후 감소 전환 | [FINRA](https://www.finra.org/investors/learn-to-invest/advanced-investing/margin-statistics) |
 | **연준 사이클** | 마지막 인상 후 6~18개월 (최고 위험) | [FRED FEDFUNDS](https://fred.stlouisfed.org/series/FEDFUNDS) |
 | **"이번엔 다르다" 내러티브** | 미디어·개인 낙관 만연, IPO 열풍 | 정성적 판단 |
