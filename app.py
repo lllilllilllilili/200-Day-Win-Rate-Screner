@@ -771,13 +771,20 @@ def _best_zone(winrates: dict):
     return z, wr
 
 
-def _winzone_lookup(ticker, gap):
+def _winzone_lookup(ticker, gap, mode="target"):
     """winzone_data에서 현재 gap에 맞는 구간 승률 조회.
+    mode: 'target'=목표+10/손절-5, 'sma'=200일선 복귀 매도.
     Returns (현재구간승률str, 최고승률구간str) — 데이터 없으면 ('-','-')."""
     v = WINZONE_DATA.get(ticker)
-    if not v or not v.get("zones"):
+    if not v:
         return "-", "-"
-    zones = v["zones"]
+    # 200일선 복귀 모드는 200일선 아래(-3% 이하)에서만 의미 있음
+    if mode == "sma" and gap > -3:
+        return "-", "-"
+    key = "zones_sma" if mode == "sma" else "zones"
+    zones = v.get(key)
+    if not zones:
+        return "-", "-"
     # 현재 gap에 가장 가까운 구간
     best_center = min(zones.keys(), key=lambda c: abs(int(c) - gap))
     wr, samp = zones[best_center]
@@ -1227,9 +1234,20 @@ def render_winzone_catcher():
         return
 
     meta = WINZONE_META
-    st.info(f"📌 **승률 정의**: 목표 **+{meta['target']:.0f}%** / 손절 **-{meta['stop']:.0f}%** "
-            f"(먼저 닿는 쪽), 최대보유 **{meta['max_hold']}거래일(약 3개월)** 기준. "
-            f"현재 200일선 위치와 비슷했던 과거 구간의 승률입니다.")
+    sell_mode = st.radio(
+        "매도 기준",
+        ["목표 +10% / 손절 -5%", "200일선 복귀 시 매도"],
+        horizontal=True, key="winzone_sellmode",
+        help="승률을 어떤 매도 전략 기준으로 볼지 선택하세요.")
+    mode = "sma" if sell_mode.startswith("200일선") else "target"
+
+    if mode == "target":
+        st.info(f"📌 **승률 정의**: 목표 **+{meta['target']:.0f}%** / 손절 **-{meta['stop']:.0f}%** "
+                f"(먼저 닿는 쪽), 최대보유 **{meta['max_hold']}거래일(약 3개월)** 기준. "
+                f"현재 200일선 위치와 비슷했던 과거 구간의 승률입니다.")
+    else:
+        st.info(f"📌 **승률 정의**: 200일선 아래에서 매수 → **최대 3개월 내 200일선 위로 복귀하면 승리**. "
+                f"200일선 아래(-3% 이하) 구간에서만 의미 있어요 (위 구간은 결과 없음).")
 
     c1, c2 = st.columns([1, 1])
     with c1:
@@ -1248,6 +1266,7 @@ def render_winzone_catcher():
     targets = [(tk, v) for tk, v in WINZONE_DATA.items()
                if market_filter == "전체" or v["market"] == mkmap.get(market_filter)]
 
+    zones_key = "zones_sma" if mode == "sma" else "zones"
     hits = []
     prog = st.progress(0.0)
     total = len(targets)
@@ -1256,8 +1275,11 @@ def render_winzone_catcher():
         gap = _current_gap(tk)
         if gap is None:
             continue
-        # 현재 gap에 가장 가까운 center 구간 찾기
-        zones = v["zones"]
+        # 200일선 복귀 모드는 200일선 아래(-3% 이하)에서만 의미 있음
+        if mode == "sma" and gap > -3:
+            continue
+        # 현재 gap에 가장 가까운 center 구간 찾기 (선택한 매도 기준의 zones)
+        zones = v.get(zones_key)
         if not zones:
             continue
         best_center = min(zones.keys(), key=lambda c: abs(int(c) - gap))
@@ -1280,7 +1302,8 @@ def render_winzone_catcher():
     prog.empty()
 
     if not hits:
-        st.warning(f"지금 승률 {threshold}% 이상 구간에 있는 종목이 없어요. "
+        extra = " (200일선 복귀 기준은 지금 200일선 아래 종목만 잡혀요)" if mode == "sma" else ""
+        st.warning(f"지금 승률 {threshold}% 이상 구간에 있는 종목이 없어요.{extra} "
                    "임계값을 낮추거나 나중에 다시 확인해 보세요.")
         return
 

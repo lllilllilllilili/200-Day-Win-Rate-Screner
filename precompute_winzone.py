@@ -40,16 +40,25 @@ def load_close(ticker):
 
 
 def zone_winrates(close: np.ndarray):
-    """구간별 (승률, 표본수) dict 반환."""
+    """구간별 승률을 두 방식으로 계산해 (zones_target, zones_sma) 반환.
+
+    zones_target: 목표 +TARGET_PCT% 익절 vs -STOP_PCT% 손절 (먼저 닿는 쪽). 전 구간.
+    zones_sma   : 200일선 복귀 시 매도. 200일선 아래(-3% 이하) 진입만 의미 있음.
+                  MAX_HOLD 내 200일선 위로 복귀하면 승리, 아니면 패배.
+    각 dict: {중심위치%: [승률%, 표본수]}
+    """
     n = len(close)
     sma = pd.Series(close).rolling(200).mean().values
     valid_sma = ~np.isnan(sma)
     gap = np.full(n, np.nan)
     gap[valid_sma] = (close[valid_sma] / sma[valid_sma] - 1) * 100
 
-    # pos별 결과 1회 계산
-    exit_win = np.zeros(n, dtype=bool)
-    has = np.zeros(n, dtype=bool)
+    # pos별 결과 1회 계산 (두 방식 동시)
+    win_target = np.zeros(n, dtype=bool)
+    has_target = np.zeros(n, dtype=bool)
+    win_sma = np.zeros(n, dtype=bool)
+    has_sma = np.zeros(n, dtype=bool)
+
     for pos in range(n - 1):
         if np.isnan(gap[pos]):
             continue
@@ -59,15 +68,25 @@ def zone_winrates(close: np.ndarray):
         if path.size == 0:
             continue
         cum = (path / entry - 1.0) * 100.0
+
+        # 방식 1: 목표/손절
         hit_t = np.argmax(cum >= TARGET_PCT) if (cum >= TARGET_PCT).any() else -1
         hit_s = np.argmax(cum <= -STOP_PCT) if (cum <= -STOP_PCT).any() else -1
-        has[pos] = True
+        has_target[pos] = True
         if hit_t != -1 and (hit_s == -1 or hit_t <= hit_s):
-            exit_win[pos] = True
+            win_target[pos] = True
         elif hit_s != -1:
-            exit_win[pos] = False
+            win_target[pos] = False
         else:
-            exit_win[pos] = cum[-1] > 0
+            win_target[pos] = cum[-1] > 0
+
+        # 방식 2: 200일선 복귀 (200일선 아래 진입만)
+        if gap[pos] <= -3:
+            fut_sma = sma[pos + 1:end + 1]
+            fut_close = path
+            recovered = fut_close > fut_sma  # 종가가 200일선 위로
+            has_sma[pos] = True
+            win_sma[pos] = bool(recovered.any())  # 3개월 내 한 번이라도 복귀하면 승리
 
     half = BAND_WIDTH / 2
     n_neg = int(np.floor((0 - ZONE_MIN) / STEP))
@@ -75,15 +94,22 @@ def zone_winrates(close: np.ndarray):
     centers = [round(-k * STEP, 6) for k in range(n_neg, 0, -1)] + \
               [round(k * STEP, 6) for k in range(0, n_pos + 1)]
 
-    out = {}
+    zones_target, zones_sma = {}, {}
     for center in centers:
         lo, hi = center - half, center + half
-        sel = has & (gap >= lo) & (gap < hi)
-        t = int(sel.sum())
+        in_zone = (gap >= lo) & (gap < hi)
+
+        sel_t = has_target & in_zone
+        t = int(sel_t.sum())
         if t >= MIN_SAMPLES:
-            wr = float(exit_win[sel].mean() * 100)
-            out[int(center)] = [round(wr, 1), t]
-    return out
+            zones_target[int(center)] = [round(float(win_target[sel_t].mean() * 100), 1), t]
+
+        sel_s = has_sma & in_zone
+        s = int(sel_s.sum())
+        if s >= MIN_SAMPLES:
+            zones_sma[int(center)] = [round(float(win_sma[sel_s].mean() * 100), 1), s]
+
+    return zones_target, zones_sma
 
 
 # 미국 시총 대형주 100 (안정성 위해 하드코딩. yfinance fast_info 시총 조회가 불안정해서)
@@ -173,10 +199,12 @@ def main():
         if close is None:
             print(f"  [{i+1}/{len(all_items)}] {tk} {nm}: 데이터 부족, 스킵")
             continue
-        zones = zone_winrates(close.values.astype(float))
-        if zones:
-            result[tk] = {"name": nm, "market": mk, "zones": zones}
-        print(f"  [{i+1}/{len(all_items)}] {tk} {nm}: 구간 {len(zones)}개")
+        zones_t, zones_s = zone_winrates(close.values.astype(float))
+        if zones_t or zones_s:
+            result[tk] = {"name": nm, "market": mk,
+                          "zones": zones_t, "zones_sma": zones_s}
+        print(f"  [{i+1}/{len(all_items)}] {tk} {nm}: "
+              f"목표/손절 {len(zones_t)}구간, 200선복귀 {len(zones_s)}구간")
         time.sleep(0.05)
 
     # winzone_data.py 로 저장 (호환성 유지)
