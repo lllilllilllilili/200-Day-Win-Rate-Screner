@@ -367,6 +367,10 @@ def zone_analysis(df: pd.DataFrame, band_width: float, step: float,
     # 200일선 복귀 방식 (200일선 아래 진입만): max_hold 내 종가가 200일선 위로 복귀하면 승리
     sma_win = np.zeros(n, dtype=bool)
     sma_has = np.zeros(n, dtype=bool)
+    # 200일선 이탈 매도 방식: 종가 < 200일선×(1-완충) 이탈 시 청산, 그 시점 수익률 +면 승리
+    br_win = np.zeros(n, dtype=bool)
+    br_has = np.zeros(n, dtype=bool)
+    BR_BUFFER = 0.05  # 이탈 완충 5% (콘텐츠 기준)
 
     for pos in range(n - 1):
         entry = close[pos]
@@ -399,6 +403,17 @@ def zone_analysis(df: pd.DataFrame, band_width: float, step: float,
             sma_has[pos] = True
             sma_win[pos] = bool((path > fut_sma).any())
 
+        # 200일선 이탈 매도 (콘텐츠 방식): 종가가 200일선×(1-완충) 아래로 이탈하면 청산
+        fut_sma_b = sma[pos + 1:end + 1]
+        sell_line = fut_sma_b * (1 - BR_BUFFER)
+        breached = np.where(path < sell_line)[0]
+        br_has[pos] = True
+        if breached.size > 0:
+            d = int(breached[0])
+            br_win[pos] = bool(path[d] > entry)  # 이탈 청산가가 진입가보다 높으면 승리
+        else:
+            br_win[pos] = bool(path[-1] > entry)  # 만기까지 안 이탈 → 만기가 진입가보다 높으면 승리
+
     valid = ~np.isnan(exit_ret)  # 결과가 있는 진입 시점
 
     # --- 2단계: 슬라이딩 구간별로 인덱싱 집계 ---
@@ -420,10 +435,11 @@ def zone_analysis(df: pd.DataFrame, band_width: float, step: float,
         # 200일선 복귀 승률 (이 구간에서 200일선 아래 진입 표본이 있을 때만)
         sma_sel = sma_has & (gap >= lo) & (gap < hi)
         sma_n = int(sma_sel.sum())
-        if sma_n > 0:
-            sma_wr = float(sma_win[sma_sel].mean() * 100)
-        else:
-            sma_wr = None
+        sma_wr = float(sma_win[sma_sel].mean() * 100) if sma_n > 0 else None
+        # 200일선 이탈 매도 승률 (콘텐츠 방식)
+        br_sel = br_has & (gap >= lo) & (gap < hi)
+        br_n = int(br_sel.sum())
+        br_wr = float(br_win[br_sel].mean() * 100) if br_n > 0 else None
         rows.append({
             "center": center,
             "zone_label": f"{fmt(lo)}%~{fmt(hi)}%",
@@ -434,6 +450,8 @@ def zone_analysis(df: pd.DataFrame, band_width: float, step: float,
             "avg_holding_days": int(round(hold_day[sel].mean())),
             "sma_win_rate": sma_wr,
             "sma_trades": sma_n,
+            "breach_win_rate": br_wr,
+            "breach_trades": br_n,
         })
 
     return pd.DataFrame(rows)
@@ -2499,10 +2517,13 @@ with tab1:
                         f"참고용으로만 보세요.")
                 st.markdown(f"폭 {band_width}%, 완충 {step}%, 목표 +{target_pct:.0f}% / 손절 -{stop_pct:.0f}% "
                             f"(먼저 닿는 쪽), 최대보유 {max_hold_choice} 기준 전수조사 결과:  \n"
-                            f"<span style='color:gray'>· '해당 가격'은 현재 200일선({cur_sma:,.2f}) 기준 그 위치 가격이에요. "
-                            f"· 승률(목표/손절) = +{target_pct:.0f}% 익절 vs -{stop_pct:.0f}% 손절. "
-                            f"· 승률(200선복귀) = 200일선 아래에서 매수 후 {max_hold_choice} 내 200일선 위로 복귀하면 승리 "
-                            f"(200일선 아래 구간만 값이 있어요).</span>", unsafe_allow_html=True)
+                            f"<span style='color:gray'>· '해당 가격'은 현재 200일선({cur_sma:,.2f}) 기준 그 위치 가격이에요.  \n"
+                            f"· <b>승률(목표/손절)</b> = 매수 후 +{target_pct:.0f}% 익절 vs -{stop_pct:.0f}% 손절 중 먼저 닿는 쪽.  \n"
+                            f"· <b>승률(200선복귀)</b> = 200일선 <b>아래</b>에서 매수 후 {max_hold_choice} 내 200일선 위로 <b>복귀하면 승리</b> "
+                            f"(아래 구간만 값 있음).  \n"
+                            f"· <b>승률(이탈매도)</b> = 매수 후 종가가 <b>200일선 -5% 아래로 이탈하면 청산</b>, 그때 수익이면 승리 "
+                            f"(아기티큐/네이버 콘텐츠 방식). 200일선 근처에서 낮게 나오는 게 정상이에요(위피소).</span>",
+                            unsafe_allow_html=True)
 
                 # HTML 테이블 생성
                 html = '<table class="position-table">'
@@ -2513,6 +2534,7 @@ with tab1:
                     <th>거래수</th>
                     <th>승률<br><span style="font-size:11px;color:#888">목표/손절</span></th>
                     <th>승률<br><span style="font-size:11px;color:#888">200선복귀</span></th>
+                    <th>승률<br><span style="font-size:11px;color:#888">이탈매도</span></th>
                     <th>평균 수익</th>
                     <th>최대 수익</th>
                     <th>평균 보유</th>
@@ -2548,6 +2570,14 @@ with tab1:
                         s_cls = "win-high" if swr >= 60 else ("win-mid" if swr >= 45 else "win-low")
                         sma_cell = f'<span class="{s_cls}">{swr:.0f}%</span>'
 
+                    # 200일선 이탈매도 승률 (콘텐츠 방식)
+                    bwr = row.get("breach_win_rate")
+                    if bwr is None or (isinstance(bwr, float) and pd.isna(bwr)):
+                        breach_cell = '<span style="color:#555">-</span>'
+                    else:
+                        b_cls = "win-high" if bwr >= 60 else ("win-mid" if bwr >= 45 else "win-low")
+                        breach_cell = f'<span class="{b_cls}">{bwr:.0f}%</span>'
+
                     html += f"""<tr{row_class}>
                         <td>{center_label}{marker}</td>
                         <td>{zone_price:,.2f}</td>
@@ -2555,6 +2585,7 @@ with tab1:
                         <td>{row['trades']}</td>
                         <td class="{wr_cls}">{wr:.0f}%</td>
                         <td>{sma_cell}</td>
+                        <td>{breach_cell}</td>
                         <td>{row['avg_return']:+.1f}%</td>
                         <td>{row['max_return']:+.1f}%</td>
                         <td>{row['avg_holding_days']}일</td>
