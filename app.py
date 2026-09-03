@@ -2428,6 +2428,20 @@ with tab1:
             gap_display = f"{cur_gap:+.1f}%"
             c4.metric("200일선 대비", gap_display)
 
+            # --- 현재 추세 (50일선 vs 200일선) ---
+            cur_sma50 = float(df["SMA50"].iloc[-1]) if "SMA50" in df.columns else None
+            if cur_sma50 is not None:
+                if cur_sma50 > cur_sma:
+                    trend_txt = "🔼 **상승추세** (50일선 > 200일선)"
+                    trend_box = st.success
+                else:
+                    trend_txt = "🔽 **하락추세** (50일선 < 200일선)"
+                    trend_box = st.error
+                gap5020 = (cur_sma50 / cur_sma - 1) * 100
+                trend_box(f"{trend_txt} · 50일선 {cur_sma50:,.2f} "
+                          f"(200일선 대비 {gap5020:+.1f}%)  \n"
+                          f"→ 위 표에서 이 종목의 **{'🔼상승추세' if cur_sma50 > cur_sma else '🔽하락추세'} 열**을 보세요.")
+
             st.markdown(
                 f"📅 **데이터 기간**: {raw_start} ~ {raw_end} "
                 f"(약 {raw_years:.1f}년, {len(raw):,} 거래일)  \n"
