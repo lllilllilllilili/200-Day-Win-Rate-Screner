@@ -324,7 +324,8 @@ def _load_fdr(ticker: str):
 def prepare(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     out["SMA200"] = out["Close"].rolling(200).mean()
-    out = out.dropna()
+    out["SMA50"] = out["Close"].rolling(50).mean()  # 추세 판정용
+    out = out.dropna(subset=["SMA200"])
     out["gap"] = (out["Close"] - out["SMA200"]) / out["SMA200"] * 100
     return out
 
@@ -354,6 +355,8 @@ def zone_analysis(df: pd.DataFrame, band_width: float, step: float,
     close = df["Close"].values
     gap = df["gap"].values
     sma = df["SMA200"].values
+    sma50 = df["SMA50"].values if "SMA50" in df.columns else sma
+    uptrend = sma50 > sma  # 추세: 50일선 > 200일선 = 상승추세
     n = len(close)
     half = band_width / 2
 
@@ -442,11 +445,20 @@ def zone_analysis(df: pd.DataFrame, band_width: float, step: float,
         br_sel = br_has & (gap >= lo) & (gap < hi)
         br_n = int(br_sel.sum())
         br_wr = float(br_win[br_sel].mean() * 100) if br_n > 0 else None
+        # 추세별 목표/손절 승률 (50일선>200일선=상승추세)
+        up_sel = sel & uptrend
+        down_sel = sel & (~uptrend)
+        up_n = int(up_sel.sum())
+        down_n = int(down_sel.sum())
+        up_wr = float(win[up_sel].mean() * 100) if up_n > 0 else None
+        down_wr = float(win[down_sel].mean() * 100) if down_n > 0 else None
         rows.append({
             "center": center,
             "zone_label": f"{fmt(lo)}%~{fmt(hi)}%",
             "trades": trades,
             "win_rate": float(win[sel].mean() * 100),
+            "up_win_rate": up_wr, "up_trades": up_n,
+            "down_win_rate": down_wr, "down_trades": down_n,
             "avg_return": float(exit_ret[sel].mean()),
             "max_return": float(np.nanmean(max_ret[sel])),
             "avg_holding_days": int(round(hold_day[sel].mean())),
@@ -2521,6 +2533,8 @@ with tab1:
                             f"(먼저 닿는 쪽), 최대보유 {max_hold_choice} 기준 전수조사 결과:  \n"
                             f"<span style='color:gray'>· '해당 가격'은 현재 200일선({cur_sma:,.2f}) 기준 그 위치 가격이에요.  \n"
                             f"· <b>승률(목표/손절)</b> = 매수 후 +{target_pct:.0f}% 익절 vs -{stop_pct:.0f}% 손절 중 먼저 닿는 쪽.  \n"
+                            f"· <b>🔼상승추세 / 🔽하락추세</b> = 목표/손절 승률을 <b>추세별로 분리</b> (50일선>200일선=상승추세). "
+                            f"괄호 안은 표본 수. 같은 위치라도 상승추세 눌림목이 하락추세보다 승률이 높은 편이에요.  \n"
                             f"· <b>승률(200선복귀)</b> = 200일선 <b>아래</b>에서 매수 후 {max_hold_choice} 내 200일선 위로 <b>복귀하면 승리</b> "
                             f"(아래 구간만 값 있음).  \n"
                             f"· <b>승률(이탈매도)</b> = 매수 후 종가가 <b>200일선 -5% 아래로 이탈하면 청산</b>, 그때 수익이면 승리 "
@@ -2535,6 +2549,8 @@ with tab1:
                     <th>구간</th>
                     <th>거래수</th>
                     <th>승률<br><span style="font-size:11px;color:#888">목표/손절</span></th>
+                    <th>승률<br><span style="font-size:11px;color:#888">🔼상승추세</span></th>
+                    <th>승률<br><span style="font-size:11px;color:#888">🔽하락추세</span></th>
                     <th>승률<br><span style="font-size:11px;color:#888">200선복귀</span></th>
                     <th>승률<br><span style="font-size:11px;color:#888">이탈매도</span></th>
                     <th>평균 수익</th>
@@ -2580,12 +2596,25 @@ with tab1:
                         b_cls = "win-high" if bwr >= 60 else ("win-mid" if bwr >= 45 else "win-low")
                         breach_cell = f'<span class="{b_cls}">{bwr:.0f}%</span>'
 
+                    # 추세별 승률 셀 (표본 있을 때만, 표본 수 툴팁)
+                    def _trend_cell(wr_key, n_key):
+                        v = row.get(wr_key)
+                        nn = int(row.get(n_key) or 0)
+                        if v is None or (isinstance(v, float) and pd.isna(v)) or nn == 0:
+                            return '<span style="color:#555">-</span>'
+                        c = "win-high" if v >= 60 else ("win-mid" if v >= 45 else "win-low")
+                        return f'<span class="{c}">{v:.0f}%</span><span style="font-size:10px;color:#666"> ({nn})</span>'
+                    up_cell = _trend_cell("up_win_rate", "up_trades")
+                    down_cell = _trend_cell("down_win_rate", "down_trades")
+
                     html += f"""<tr{row_class}>
                         <td>{center_label}{marker}</td>
                         <td>{zone_price:,.2f}</td>
                         <td>{row['zone_label']}</td>
                         <td>{row['trades']}</td>
                         <td class="{wr_cls}">{wr:.0f}%</td>
+                        <td>{up_cell}</td>
+                        <td>{down_cell}</td>
                         <td>{sma_cell}</td>
                         <td>{breach_cell}</td>
                         <td>{row['avg_return']:+.1f}%</td>
