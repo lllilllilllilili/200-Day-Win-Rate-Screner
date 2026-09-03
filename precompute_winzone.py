@@ -11,6 +11,8 @@
 import sys
 import time
 import json
+import pprint
+from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -28,6 +30,9 @@ def load_close(ticker):
     try:
         raw = yf.download(ticker, start="2000-01-01", auto_adjust=True, progress=False)
         if raw is None or len(raw) == 0:
+            # 날짜 범위 endpoint가 간헐적으로 실패하는 종목은 period=max로 한 번 재시도한다.
+            raw = yf.download(ticker, period="max", auto_adjust=True, progress=False)
+        if raw is None or len(raw) == 0:
             return None
         if isinstance(raw.columns, pd.MultiIndex):
             raw.columns = raw.columns.get_level_values(0)
@@ -41,7 +46,7 @@ def load_close(ticker):
 
 def fetch_valuation(ticker):
     """yfinance .info에서 밸류에이션 지표 수집. 결측은 None.
-    Returns {per, pbr, psr, div} (div=배당수익률%)."""
+    Returns {per, pbr, psr}."""
     try:
         info = yf.Ticker(ticker).info
     except Exception:
@@ -64,9 +69,11 @@ def fetch_valuation(ticker):
 def zone_winrates(close: np.ndarray):
     """구간별 승률을 두 방식으로 계산해 (zones_target, zones_sma) 반환.
 
-    zones_target: 목표 +TARGET_PCT% 익절 vs -STOP_PCT% 손절 (먼저 닿는 쪽). 전 구간.
+    zones_target: +TARGET_PCT% 목표 선도달은 성공, -STOP_PCT% 손절 선도달은 실패.
+                  둘 다 미도달하면 MAX_HOLD 만기 수익이 양수일 때 성공. 전 구간.
     zones_sma   : 200일선 복귀 시 매도. 200일선 아래(-3% 이하) 진입만 의미 있음.
-                  MAX_HOLD 내 200일선 위로 복귀하면 승리, 아니면 패배.
+                  MAX_HOLD 내 200일선 위로 복귀하면 성공, 아니면 실패.
+    두 방식 모두 MAX_HOLD 미래 데이터가 온전히 남은 진입만 집계한다.
     각 dict: {중심위치%: [승률%, 표본수]}
     """
     n = len(close)
@@ -81,14 +88,13 @@ def zone_winrates(close: np.ndarray):
     win_sma = np.zeros(n, dtype=bool)
     has_sma = np.zeros(n, dtype=bool)
 
-    for pos in range(n - 1):
+    # 모든 진입이 동일한 MAX_HOLD 미래 관측치를 갖도록 불완전한 tail은 제외한다.
+    for pos in range(max(0, n - MAX_HOLD)):
         if np.isnan(gap[pos]):
             continue
         entry = close[pos]
-        end = min(pos + MAX_HOLD, n - 1)
+        end = pos + MAX_HOLD
         path = close[pos + 1:end + 1]
-        if path.size == 0:
-            continue
         cum = (path / entry - 1.0) * 100.0
 
         # 방식 1: 목표/손절
@@ -108,7 +114,7 @@ def zone_winrates(close: np.ndarray):
             fut_close = path
             recovered = fut_close > fut_sma  # 종가가 200일선 위로
             has_sma[pos] = True
-            win_sma[pos] = bool(recovered.any())  # 3개월 내 한 번이라도 복귀하면 승리
+            win_sma[pos] = bool(recovered.any())  # 3개월 내 한 번이라도 복귀하면 성공
 
     half = BAND_WIDTH / 2
     n_neg = int(np.floor((0 - ZONE_MIN) / STEP))
@@ -143,7 +149,7 @@ US_TOP100_TICKERS = [
     "PM", "TXN", "ISRG", "QCOM", "DIS", "CAT", "VZ", "INTU", "GS", "T",
     "BKNG", "AMGN", "SPGI", "RTX", "NOW", "UBER", "PGR", "MS", "NEE", "HON",
     "LOW", "UNP", "AMAT", "BLK", "SCHW", "TJX", "SYK", "C", "BSX", "COP",
-    "DHR", "PLD", "VRTX", "ADP", "BA", "MDT", "GILD", "MMC", "ADI", "LRCX",
+    "DHR", "PLD", "VRTX", "ADP", "BA", "MDT", "GILD", "MRSH", "ADI", "LRCX",
     "ETN", "CB", "MU", "KLAC", "AMT", "SBUX", "ANET", "PANW", "INTC", "MO",
     "SO", "ELV", "ICE", "KKR", "REGN", "DUK", "PYPL", "APH", "CI", "SHW",
 ]
@@ -274,6 +280,20 @@ def main():
           f"환율/국채 {len(fxb)}개, 지수 {len(idx)}개")
 
     result = {}
+    # 재계산 시 기존 밸류에이션을 재사용해 200여 회의 느린 .info 호출을 피한다.
+    existing_values = {}
+    valuation_as_of = "unknown_legacy"
+    try:
+        with open("winzone_data.json", encoding="utf-8") as f:
+            previous_payload = json.load(f)
+        previous = previous_payload.get("data", {})
+        previous_meta = previous_payload.get("meta", {})
+        existing_values = {tk: v.get("val") for tk, v in previous.items() if v.get("val")}
+        valuation_as_of = previous_meta.get("valuation_as_of", "unknown_legacy")
+        print(f"  기존 밸류에이션 {len(existing_values)}개 재사용 (기준일 {valuation_as_of})")
+    except Exception:
+        pass
+
     all_items = ([(tk, nm, "US") for tk, nm in us]
                  + [(tk, nm, "KR") for tk, nm in kr]
                  + [(tk, nm, "ALT") for tk, nm in alt]
@@ -291,7 +311,7 @@ def main():
                      "zones": zones_t, "zones_sma": zones_s}
             # 주식(US/KR)만 밸류에이션 수집 (지수/환율/국채/코인은 의미 없음)
             if mk in ("US", "KR"):
-                entry["val"] = fetch_valuation(tk)
+                entry["val"] = existing_values.get(tk) or fetch_valuation(tk)
             result[tk] = entry
         print(f"  [{i+1}/{len(all_items)}] {tk} {nm}: "
               f"목표/손절 {len(zones_t)}구간, 200선복귀 {len(zones_s)}구간")
@@ -300,23 +320,29 @@ def main():
     # --- 밸류에이션 상대순위 → 고평가 점수(0~100) 계산 ---
     _compute_valuation_scores(result)
 
+    generated_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    meta = {
+        "target": TARGET_PCT, "stop": STOP_PCT, "max_hold": MAX_HOLD,
+        "band": BAND_WIDTH, "step": STEP,
+        "generated_at": generated_at, "price_source": "Yahoo Finance auto_adjust=True",
+        "history_start": "2000-01-01", "tail_policy": "full_horizon_only",
+        "success_rule": "target_first_or_positive_expiry",
+        "valuation_policy": "reuse_previous_values_fetch_missing",
+        "valuation_as_of": valuation_as_of,
+    }
+
     # winzone_data.py 로 저장 (호환성 유지)
     with open("winzone_data.py", "w", encoding="utf-8") as f:
         f.write('"""승률 포착기 사전 계산 데이터 (precompute_winzone.py 로 생성).\n')
         f.write(f'기준: 목표+{TARGET_PCT:.0f}% / 손절-{STOP_PCT:.0f}% / 최대보유 {MAX_HOLD}거래일\n')
         f.write('각 종목 zones: {중심위치%: [승률%, 표본수]}\n"""\n')
-        f.write(f"WINZONE_META = {{'target': {TARGET_PCT}, 'stop': {STOP_PCT}, 'max_hold': {MAX_HOLD}, "
-                f"'band': {BAND_WIDTH}, 'step': {STEP}}}\n\n")
+        f.write(f"WINZONE_META = {repr(meta)}\n\n")
         f.write("WINZONE_DATA = ")
-        f.write(json.dumps(result, ensure_ascii=False, indent=0))
+        f.write(pprint.pformat(result, width=120, sort_dicts=False))
         f.write("\n")
 
     # winzone_data.json 으로도 저장 (앱은 이걸 사용 — 로딩이 가볍고 안정적)
-    payload = {
-        "meta": {"target": TARGET_PCT, "stop": STOP_PCT, "max_hold": MAX_HOLD,
-                 "band": BAND_WIDTH, "step": STEP},
-        "data": result,
-    }
+    payload = {"meta": meta, "data": result}
     with open("winzone_data.json", "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, separators=(',', ':'))
     print(f"\n완료: {len(result)}개 종목 -> winzone_data.py + winzone_data.json")

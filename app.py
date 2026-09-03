@@ -2,7 +2,7 @@
 200일선 위치별 승률 스크리너
 ================================
 종목 검색 → 200일선 대비 위치를 구간별로 쪼개서
-거래수 / 승률 / 평균수익 / 최대수익 / 평균보유일수 를 전수조사 테이블로 보여준다.
+거래수 / 전략 성공률 / 평균수익 / 평균 최대도달 / 평균보유일수 를 전수조사 테이블로 보여준다.
 현재 위치에 해당하는 행을 하이라이트해서 "지금 여기서 사면 역사적으로 어땠는지"를 직감적으로 확인.
 
 데이터: Yahoo Finance (미국주식/ETF, 코인),
@@ -343,18 +343,18 @@ def zone_analysis(df: pd.DataFrame, band_width: float, step: float,
 
     구간 생성 (슬라이딩 윈도우):
       - 중심(center)을 0%부터 step% 간격으로 양/음 방향으로 찍는다.
-      - 각 중심마다 [center - band_width/2, center + band_width/2] 를 구간으로.
+      - 각 중심마다 [center - band_width/2, center + band_width/2) 를 구간으로.
       - step < band_width 이면 인접 구간이 겹친다 (한 날이 여러 구간에 중복 집계).
       - step == band_width 이면 겹치지 않는다.
 
     판정:
-      - 목표수익(target_pct%)에 먼저 닿으면 승리(익절)
-      - 손절(stop_pct%)에 먼저 닿으면 패배
-      - max_hold 거래일 안에 둘 다 안 닿으면, 만기 시점 수익률 부호로 판정
+      - 목표수익(target_pct%)에 먼저 닿으면 성공
+      - 손절(stop_pct%)에 먼저 닿으면 실패
+      - max_hold 거래일 안에 둘 다 안 닿으면, 만기 수익률이 양수일 때 성공
+      - max_hold 미래 데이터가 온전히 남은 진입만 집계
 
-    Returns DataFrame with columns:
-        center, zone_label, trades, win_rate, avg_return,
-        max_return, avg_holding_days
+    Returns DataFrame with primary/trend/alternative success rates, their sample counts,
+    average exit return, exit-limited average MFE, and average holding days.
     """
     close = df["Close"].values
     gap = df["gap"].values
@@ -379,39 +379,44 @@ def zone_analysis(df: pd.DataFrame, band_width: float, step: float,
     br_has = np.zeros(n, dtype=bool)
     BR_BUFFER = 0.05  # 이탈 완충 5% (콘텐츠 기준)
 
-    for pos in range(n - 1):
+    # 모든 전략의 표본이 동일한 최대 보유기간을 갖도록 미래 데이터가
+    # max_hold 거래일 온전히 남아 있는 진입일만 사용한다.
+    for pos in range(max(0, n - max_hold)):
         entry = close[pos]
-        end = min(pos + max_hold, n - 1)
+        end = pos + max_hold
         path = close[pos + 1:end + 1]
-        if path.size == 0:
-            continue
         cum = (path / entry - 1.0) * 100.0
-        max_ret[pos] = cum.max()
 
         hit_t = np.argmax(cum >= target_pct) if (cum >= target_pct).any() else -1
         hit_s = np.argmax(cum <= -stop_pct) if (cum <= -stop_pct).any() else -1
 
         if hit_t != -1 and (hit_s == -1 or hit_t <= hit_s):
+            exit_idx = int(hit_t)
             win[pos] = True
             exit_ret[pos] = target_pct
-            hold_day[pos] = hit_t + 1
+            hold_day[pos] = exit_idx + 1
         elif hit_s != -1:
+            exit_idx = int(hit_s)
             exit_ret[pos] = -stop_pct
-            hold_day[pos] = hit_s + 1
+            hold_day[pos] = exit_idx + 1
         else:
-            final = cum[-1]
+            exit_idx = path.size - 1
+            final = cum[exit_idx]
             win[pos] = final > 0
             exit_ret[pos] = final
             hold_day[pos] = path.size
 
-        # 200일선 복귀 (진입 시점이 200일선 아래일 때만)
+        # 목표/손절/만기 중 실제 청산일까지의 최대 유리 수익률(MFE, 진입 시점 0% 포함).
+        # 청산 뒤 반등·상승은 이 거래의 성과에 포함하지 않는다.
+        max_ret[pos] = max(0.0, float(cum[:exit_idx + 1].max()))
+
+        # 200일선 복귀: 진입 괴리율 -3% 이하 표본만 계산한다.
         if gap[pos] <= -3:
             fut_sma = sma[pos + 1:end + 1]
             sma_has[pos] = True
             sma_win[pos] = bool((path > fut_sma).any())
 
-        # 200일선 이탈 매도 (콘텐츠 방식): 종가가 200일선×(1-완충) 아래로 이탈하면 청산.
-        # 단, 매수 시점에 이미 이탈선(-완충%) 아래이면 계산 제외 (매수 즉시 청산 = 무의미한 반등매매).
+        # 200일선 이탈 매도: 진입 당시 이미 -5% 이탈선 아래인 표본은 제외한다.
         if gap[pos] > -BR_BUFFER * 100:
             fut_sma_b = sma[pos + 1:end + 1]
             sell_line = fut_sma_b * (1 - BR_BUFFER)
@@ -419,9 +424,9 @@ def zone_analysis(df: pd.DataFrame, band_width: float, step: float,
             br_has[pos] = True
             if breached.size > 0:
                 d = int(breached[0])
-                br_win[pos] = bool(path[d] > entry)  # 이탈 청산가가 진입가보다 높으면 승리
+                br_win[pos] = bool(path[d] > entry)
             else:
-                br_win[pos] = bool(path[-1] > entry)  # 만기까지 안 이탈 → 만기가 진입가보다 높으면 승리
+                br_win[pos] = bool(path[-1] > entry)
 
     valid = ~np.isnan(exit_ret)  # 결과가 있는 진입 시점
 
@@ -475,6 +480,16 @@ def zone_analysis(df: pd.DataFrame, band_width: float, step: float,
     return pd.DataFrame(rows)
 
 
+def _match_zone_center(centers, gap: float, band_width: float):
+    """Return the nearest populated center whose [lo, hi) interval contains gap."""
+    half = float(band_width) / 2
+    matches = [
+        center for center in centers
+        if float(center) - half <= gap < float(center) + half
+    ]
+    return min(matches, key=lambda center: abs(float(center) - gap)) if matches else None
+
+
 # ============================================================
 # 추가 도구 1: 크립토 200일선 × MVRV 스크리너
 # ============================================================
@@ -515,10 +530,12 @@ def _load_btc_mvrv():
 
 
 def _mvrv_zone(v):
+    if v is None or not np.isfinite(v):
+        return None
     for zone, (lo, hi) in _MVRV_ZONES.items():
         if lo <= v < hi:
             return zone
-    return 'extreme'
+    return None
 
 
 def render_crypto_screener():
@@ -558,11 +575,14 @@ def render_crypto_screener():
     if btc_mvrv is not None and len(btc_mvrv) > 0:
         mv = float(btc_mvrv.iloc[-1]["mvrv"])
         zone = _mvrv_zone(mv)
-        emoji, label = _MVRV_LABEL[zone]
         mv_date = btc_mvrv.index[-1].strftime("%Y-%m-%d")
-        st.markdown(f"**BTC MVRV**: {mv:.3f} {emoji} — {label}  \n"
-                    f"<span style='color:gray'>기준일 {mv_date} · MVRV 1.5 이하면 크립토 전반 저평가</span>",
-                    unsafe_allow_html=True)
+        if zone is None:
+            st.warning(f"BTC MVRV 최신값이 유효하지 않아요 (기준일 {mv_date}). 가격/200일선만 참고하세요.")
+        else:
+            emoji, label = _MVRV_LABEL[zone]
+            st.markdown(f"**BTC MVRV**: {mv:.3f} {emoji} — {label}  \n"
+                        f"<span style='color:gray'>기준일 {mv_date} · MVRV 1.5 이하면 크립토 전반 저평가</span>",
+                        unsafe_allow_html=True)
     else:
         st.warning("BTC MVRV 데이터를 불러오지 못했어요 (외부 API). 가격/200일선 정보만 표시합니다.")
 
@@ -635,9 +655,13 @@ def _crash_indicators():
         rr = (float(rsp6["Close"].iloc[-1]) / float(rsp6["Close"].iloc[0]) - 1) * 100
         div = sr - rr
         ad = abs(div) if div > 0 else 0
-        if ad <= 2: score = 10
-        elif ad >= 15: score = 100
-        else: score = min(100, int((ad - 2) / 13 * 100))
+        if ad <= 2:
+            score = 10
+        elif ad >= 15:
+            score = 100
+        else:
+            # 2%p의 10점에서 15%p의 100점까지 단조롭게 증가한다.
+            score = int(round(10 + (ad - 2) / 13 * 90))
         stt = "점등" if div >= 10 else ("경계" if div >= 5 else "정상")
         out.append(("시장 폭 (SPY vs RSP, 6M)", f"{div:+.1f}%p", stt, score,
                     "괴리 클수록 소수 대형주 의존"))
@@ -738,7 +762,8 @@ def render_crash_scanner():
     else:
         level, rec, box = "안전", "정상 투자 유지, 장기 매수 전략 지속", st.success
 
-    box(f"**종합 위험도 {overall}/100 [{level}]** · 점등 {lit} / 경계 {caution} / 정상 {normal}  \n권고: {rec}")
+    box(f"**종합 위험도 {overall}/100 [{level}]** · 자동 지표 {len(inds)}/6개 로드 "
+        f"(점등 {lit} / 경계 {caution} / 정상 {normal})  \n권고: {rec}")
 
     mark = {"점등": "🔴", "경계": "🟡", "정상": "🟢"}
     st.markdown("#### 📡 자동 점등 지표 (실시간)")
@@ -872,9 +897,10 @@ def detect_box(df: pd.DataFrame, lookback: int = 60, tol: float = 0.03):
       pos_pct: 현재가의 박스 내 위치 (0=하단, 100=상단)
       status: 상태 문자열
     """
-    if df is None or len(df) < lookback + 5:
+    if df is None or len(df) < lookback + 1:
         return None
-    close = df["Close"].values[-lookback:]
+    # 현재 봉은 박스 기준 고저점에서 제외해야 돌파/이탈을 판정할 수 있다.
+    close = df["Close"].values[-(lookback + 1):-1]
     cur = float(df["Close"].iloc[-1])
 
     hi = float(np.max(close))
@@ -950,9 +976,12 @@ def _fmt_valuation(f):
     flags = []  # 고평가 신호 개수
     per, pbr, psr = f.get("per"), f.get("pbr"), f.get("psr")
     if per is not None:
-        tag = "🔴높음" if per >= 30 else ("🟡보통" if per >= 15 else "🟢낮음")
-        if per >= 30:
-            flags.append(1)
+        if per <= 0:
+            tag = "⚪적자/의미 없음"
+        else:
+            tag = "🔴높음" if per >= 30 else ("🟡보통" if per >= 15 else "🟢낮음")
+            if per >= 30:
+                flags.append(1)
         details.append(("PER", f"{per:.1f}", tag))
     if pbr is not None:
         tag = "🔴높음" if pbr >= 5 else ("🟡보통" if pbr >= 1.5 else "🟢낮음")
@@ -966,7 +995,10 @@ def _fmt_valuation(f):
         details.append(("PSR", f"{psr:.2f}", tag))
     if not details:
         return "-", []
-    if len(flags) >= 2:
+    meaningful = int(per is not None and per > 0) + int(pbr is not None and pbr > 0) + int(psr is not None and psr > 0)
+    if meaningful == 0:
+        summary = "⚪ 판단 유보"
+    elif len(flags) >= 2:
         summary = "🔴 고평가 경향"
     elif len(flags) == 1:
         summary = "🟡 일부 고평가"
@@ -1112,10 +1144,14 @@ def _winzone_lookup(ticker, gap, mode="target"):
     zones = v.get(key)
     if not zones:
         return "-", "-"
-    # 현재 gap에 가장 가까운 구간
-    best_center = min(zones.keys(), key=lambda c: abs(int(c) - gap))
-    wr, samp = zones[best_center]
-    cur_str = f"{wr:.0f}% ({samp}건)"
+    # 현재 gap을 실제로 포함하는 사전계산 구간만 매칭한다.
+    band = float(WINZONE_META.get("band", 10))
+    best_center = _match_zone_center(zones.keys(), gap, band)
+    if best_center is None:
+        cur_str = "-"
+    else:
+        wr, samp = zones[best_center]
+        cur_str = f"{wr:.0f}% ({samp}건)"
     # 최고 승률 구간
     bz = max(zones.items(), key=lambda kv: kv[1][0])
     best_str = f"{int(bz[0]):+d}% ({bz[1][0]:.0f}%)"
@@ -1204,7 +1240,8 @@ def render_kr_winzone():
         "**타입 A** 얕게(-5 ~ -10%가 스윗스팟) · **타입 B** 깊이(-15 ~ -20%가 최적) · "
         "**타입 C** 비추(SK하이닉스·카카오게임즈)  \n"
         "<span style='color:gray'>· '최고 승률 구간'은 그 종목이 200일선 아래 해당 지점까지 내려왔을 때 "
-        "역사적으로 가장 높았던 매수 승률입니다 (Yahoo Finance 전체 기간 전수조사 내장값). "
+        "역사적으로 가장 높았던 매수 승률인 앱 내 참고값입니다. "
+        "이 저장소에는 해당 국장 통계의 생성 산식·기준일이 없어 독립 재현 검증하지 못했습니다. "
         "200일선 위 매수의 승률이 아니라, '내려오면 여기가 기회'라는 참고 지표예요.</span>",
         unsafe_allow_html=True)
 
@@ -1213,7 +1250,7 @@ def render_us_winzone():
     st.markdown("#### 🇺🇸 미국 대형주 200일선 매수 전략 스캐너")
     st.caption("'200일선 아래로 내려오면 매수' 전략. "
                "복귀 빠른 TOP50 종목의 현재 위치·구간 승률·복귀 기간을 함께 봅니다.  \n"
-               "📏 **승률 기준: +10% 익절 / -5% 손절, 최대보유 3개월** "
+               "📏 **성공 기준: +10% 목표 선도달 또는 3개월 만기 양수 / -5% 손절 선도달은 실패** "
                "(국장 스캐너의 '200일선 복귀 시 매도' 기준과 달라요).")
 
     # 복귀 빠른 순(평균 복귀일)으로 정렬, 중복 티커 제거
@@ -1300,14 +1337,15 @@ def render_us_winzone():
         "<span style='color:gray'>· 복귀 빠른 순(평균 복귀일)으로 정렬. "
         "복귀가 빠른 종목일수록 200일선 아래에서 모을 시간이 짧으니 '내려오자마자' 사야 하고, "
         "느린 종목은 여유 있게 분할 매수할 수 있어요. "
-        "복귀 기간은 미국 시총 TOP50 전수 분석 내장값입니다 (Yahoo Finance 전체 기간).</span>",
+        "복귀 기간은 미국 시총 TOP50 앱 내 참고값입니다. "
+        "이 저장소에는 산식 생성기·정확한 기준일이 없어 독립 재현 검증하지 못했습니다.</span>",
         unsafe_allow_html=True)
 
 
 def render_alt_winzone():
     st.markdown("#### 🪙 알트코인 200일선 매수 전략 스캐너")
     st.caption("주요 알트코인의 현재 200일선 위치와 그 위치의 역사적 승률을 봅니다.  \n"
-               "📏 **승률 기준: +10% 익절 / -5% 손절, 최대보유 3개월** "
+               "📏 **성공 기준: +10% 목표 선도달 또는 3개월 만기 양수 / -5% 손절 선도달은 실패** "
                "(국장 스캐너의 '200일선 복귀 시 매도' 기준과 달라요).")
 
     alts = [(tk, v["name"]) for tk, v in WINZONE_DATA.items() if v.get("market") == "ALT"]
@@ -1342,15 +1380,16 @@ def render_alt_winzone():
     df["_sort"] = df["현재 괴리율"].str.rstrip("%").astype(float)
     df = df.sort_values("_sort").drop(columns="_sort")
     st.dataframe(df, use_container_width=True, hide_index=True)
-    st.caption("· '구간 승률'은 현재 괴리율과 가장 가까운 구간의 역사적 승률(표본수)이에요. "
-               "· 코인은 변동성이 커서 표본·승률 해석에 주의하세요. 과거 성과가 미래를 보장하지 않습니다.")
+    st.caption("· '구간 성공률'은 현재 괴리율을 실제로 포함하는 사전계산 구간의 성공률(표본수)이에요. "
+               "포함 구간이 없으면 '-'로 표시합니다. "
+               "· 코인은 변동성이 커서 표본·성공률 해석에 주의하세요. 과거 성과가 미래를 보장하지 않습니다.")
 
 
 def render_fxb_winzone():
     st.markdown("#### 💱 환율 · 국채 200일선 승률 스캐너")
-    st.caption("환율·국채의 현재 200일선 위치와 그 위치의 역사적 승률(목표+10/손절-5, 3개월)을 봅니다.  \n"
-               "⚠️ 환율·국채는 주식과 성격이 달라요. '승률'은 이 위치에서 +10% 오를 확률이에요 "
-               "(환율 '위'=달러 강세 지속, 채권 ETF '위'=채권가격 상승 지속).")
+    st.caption("환율·국채의 현재 200일선 위치와 목표/손절 전략의 역사적 성공률을 봅니다.  \n"
+               "⚠️ 성공률은 +10% 목표 선도달뿐 아니라, 목표·손절 미도달 시 3개월 만기 수익이 +인 경우도 포함합니다. "
+               "환율·국채는 주식과 성격이 다르므로 같은 기준으로 직접 비교하지 마세요.")
 
     fxbs = [(tk, v["name"]) for tk, v in WINZONE_DATA.items() if v.get("market") == "FXB"]
     if not fxbs:
@@ -1603,6 +1642,8 @@ def render_winzone_catcher():
         return
 
     meta = WINZONE_META
+    generated_date = str(meta.get("generated_at", "미기록"))[:10]
+    valuation_date = str(meta.get("valuation_as_of", "미기록"))[:10]
     sell_mode = st.radio(
         "매도 기준",
         ["목표 +10% / 손절 -5%", "200일선 복귀 시 매도"],
@@ -1611,12 +1652,14 @@ def render_winzone_catcher():
     mode = "sma" if sell_mode.startswith("200일선") else "target"
 
     if mode == "target":
-        st.info(f"📌 **승률 정의**: 목표 **+{meta['target']:.0f}%** / 손절 **-{meta['stop']:.0f}%** "
-                f"(먼저 닿는 쪽), 최대보유 **{meta['max_hold']}거래일(약 3개월)** 기준. "
-                f"현재 200일선 위치와 비슷했던 과거 구간의 승률입니다.")
+        st.info(f"📌 **전략 성공률 정의**: 목표 **+{meta['target']:.0f}%** 먼저 도달은 성공, "
+                f"손절 **-{meta['stop']:.0f}%** 먼저 도달은 실패. 둘 다 미도달하면 "
+                f"**{meta['max_hold']}거래일(약 3개월) 만기 수익이 +면 성공**입니다. "
+                f"완전한 보유기간이 남은 과거 진입만 집계합니다.")
     else:
-        st.info(f"📌 **승률 정의**: 200일선 아래에서 매수 → **최대 3개월 내 200일선 위로 복귀하면 승리**. "
-                f"200일선 아래(-3% 이하) 구간에서만 의미 있어요 (위 구간은 결과 없음).")
+        st.info(f"📌 **복귀 성공률 정의**: 괴리율 **-3% 이하**에서 매수 → "
+                f"최대 {meta['max_hold']}거래일 내 종가가 200일선 위로 복귀하면 성공. "
+                f"완전한 보유기간이 남은 과거 진입만 집계합니다.")
 
     c1, c2 = st.columns([1, 1])
     with c1:
@@ -1627,10 +1670,12 @@ def render_winzone_catcher():
         market_filter = st.selectbox("시장", ["전체", "미국", "국장", "알트", "환율/국채"], index=0)
 
     bull_only = st.checkbox(
-        "🐂 강세장 필터 (지수 200일선 위 + 지수 승률 60%↑ 시장의 200일선 위 종목만)",
-        value=False, key="winzone_bull",
-        help="시장 지수가 강세일 때, 그 시장에서 200일선 위이면서 승률이 임계값 이상인 종목만 봅니다. "
-             "코스피/코스닥은 국장, S&P500/나스닥은 미국 시장 판단에 사용돼요.")
+        "🐂 강세장 필터 (지수 200일선 위 + 지수 성공률 60%↑ 시장의 200일선 위 종목만)",
+        value=False, key="winzone_bull", disabled=(mode == "sma"),
+        help="목표/손절 모드에서만 사용합니다. 시장 지수가 강세일 때 그 시장의 200일선 위 종목만 봅니다.")
+    if mode == "sma":
+        bull_only = False
+        st.caption("· 200선복귀 모드는 -3% 이하 진입만 보므로, 200일선 위만 고르는 강세장 필터는 적용하지 않습니다.")
 
     if not st.button("🔍 승률 포착 스캔", type="primary", key="winzone_scan"):
         st.info("버튼을 눌러 지금 고승률 구간에 있는 종목을 찾아보세요. "
@@ -1673,11 +1718,13 @@ def render_winzone_catcher():
         # 200일선 복귀 모드는 200일선 아래(-3% 이하)에서만 의미 있음
         if mode == "sma" and gap > -3:
             continue
-        # 현재 gap에 가장 가까운 center 구간 찾기 (선택한 매도 기준의 zones)
+        # 현재 gap을 실제로 포함하는 사전계산 구간만 매칭한다.
         zones = v.get(zones_key)
         if not zones:
             continue
-        best_center = min(zones.keys(), key=lambda c: abs(int(c) - gap))
+        best_center = _match_zone_center(zones.keys(), gap, float(meta.get("band", 10)))
+        if best_center is None:
+            continue
         wr, samples = zones[best_center]
         if wr >= threshold:
             mk_emoji = {"US": "🇺🇸", "KR": "🇰🇷", "ALT": "🪙", "FXB": "💱"}.get(v["market"], "")
@@ -1748,10 +1795,10 @@ def render_winzone_catcher():
     f = df_full.copy()
     f = f[(f["_gap"] >= gap_range[0]) & (f["_gap"] <= gap_range[1])]
     f = f[f["_samples"] >= min_samples]
-    # RSI 필터 (결측은 유지)
-    f = f[f["_rsi"].isna() | ((f["_rsi"] >= rsi_range[0]) & (f["_rsi"] <= rsi_range[1]))]
+    # 범위 필터는 해당 지표가 있는 종목만 통과시킨다.
+    f = f[f["_rsi"].notna() & (f["_rsi"] >= rsi_range[0]) & (f["_rsi"] <= rsi_range[1])]
     if only_undervalued:
-        f = f[f["_vscore"].isna() | (f["_vscore"] < 70)]
+        f = f[f["_vscore"].notna() & (f["_vscore"] < 70)]
 
     # 정렬
     sort_col = {"역사적 승률": "_wr", "현재 괴리율": "_gap", "RSI": "_rsi",
@@ -1763,10 +1810,11 @@ def render_winzone_catcher():
     show_cols = [c for c in f.columns if not c.startswith("_")]
     st.dataframe(f[show_cols], use_container_width=True, hide_index=True)
 
-    st.caption("· '매칭 구간'은 현재 괴리율과 가장 가까운 사전계산 구간이에요. "
-               "· 승률은 사전 백테스트(Yahoo Finance 전체 기간) 내장값이며 계산 시점 기준입니다. "
+    st.caption("· '매칭 구간'은 현재 괴리율을 실제로 포함하는 사전계산 구간이에요. 포함 구간이 없으면 결과에서 제외합니다. "
+               f"· 성공률은 목표 선도달 또는 만기 양수 기준의 사전 백테스트 내장값입니다 (생성일 {generated_date}). "
                "· '고평가'는 PER·PBR·PSR을 같은 시장 내에서 상대 순위로 종합한 점수(0~100, 높을수록 고평가)예요. "
-               "밸류에이션 결측 종목·지수/코인/환율은 '-'로 표시됩니다. "
+               f"밸류에이션 기준일은 {valuation_date}이며, 미상인 경우 최신성은 보장되지 않습니다. "
+               "결측 종목·지수/코인/환율은 '-'로 표시됩니다. "
                "· 표본이 적은 구간은 신뢰도가 낮을 수 있어요. 과거 성과가 미래를 보장하지 않습니다.")
 
 
@@ -1842,7 +1890,8 @@ def render_sector_rotation():
         st.markdown("세금 손실 매도(10월) 종료 후 재매수 · 산타랠리 · 선거 불확실성 해소 · "
                     "블랙프라이데이 소비 기대 · 기관 연말 성과 매수")
 
-    st.caption("데이터: Yahoo Finance 섹터 ETF, 1999~2026 (내장값). "
+    st.caption("데이터: Yahoo Finance 섹터 ETF, 1999~2026로 표기된 앱 내 참고값. "
+               "이 저장소에는 산식 생성기·정확한 기준일이 없어 독립 재현 검증하지 못했습니다. "
                "XLC(2018)·XLRE(2015)는 표본이 짧음. 순환매는 확률이지 확정이 아니며, "
                "과거 패턴이 미래를 보장하지 않습니다.")
 
@@ -1905,7 +1954,8 @@ def render_recovery():
 3. 최악은 1~2년이지만 TOP50은 반드시 복귀 — 2년 이상 머문 종목 0건
         """)
 
-    st.caption("데이터: Yahoo Finance 전체 기간 · 미국 시총 TOP50 · 총 7,900 이탈→복귀 사이클 (내장값). "
+    st.caption("데이터: Yahoo Finance 전체 기간으로 표기된 미국 시총 TOP50 · 총 7,900 이탈→복귀 사이클 참고값. "
+               "이 저장소에는 산식 생성기·정확한 기준일이 없어 독립 재현 검증하지 못했습니다. "
                "과거 성과가 미래를 보장하지 않습니다.")
 
 
@@ -2041,15 +2091,22 @@ def render_rotation():
         if all(v is None for v in statuses.values()):
             st.error("데이터를 불러오지 못했어요.")
         else:
-            # 우선순위대로 '보유 가능(200일선 위/완충 내)'인 첫 종목 선택
+            # 우선순위대로 보며, 첫 보유 가능 종목보다 앞선 상태가 미확인일 때만 보류한다.
             target = None
+            blocking_asset = None
             for a in _ROTATION_ASSETS:
                 s = statuses.get(a["ticker"])
-                if s and s["holdable"]:
+                if s is None:
+                    blocking_asset = a
+                    break
+                if s["holdable"]:
                     target = a
                     break
 
-            if target is None:
+            if blocking_asset is not None:
+                st.warning(f"⚠️ **추천 보류** — 상위 우선순위 **{blocking_asset['name']}** 데이터를 "
+                           "확인하지 못했어요. 상태를 모른 채 하위 종목을 추천하지 않습니다.")
+            elif target is None:
                 st.warning("⏸️ **전부 200일선 아래 → 현금(SGOV) 대피 구간**  \n"
                            "→ 세 종목 모두 매도선 아래예요. SGOV에서 대기하세요.")
             else:
@@ -2064,7 +2121,7 @@ def render_rotation():
                 s = statuses.get(a["ticker"])
                 if not s:
                     rows.append({"우선순위": a["prio"], "종목": a["name"],
-                                 "현재가": "-", "200일선": "-", "괴리율": "-", "상태": "데이터 없음"})
+                                 "기준일": "-", "현재가": "-", "200일선": "-", "괴리율": "-", "상태": "데이터 없음"})
                     continue
                 if target and a["ticker"] == target["ticker"]:
                     stt = "🟢 보유 (현재 타겟)"
@@ -2073,25 +2130,24 @@ def render_rotation():
                 else:
                     stt = "🔴 200일선 아래 (제외)"
                 rows.append({
-                    "우선순위": a["prio"], "종목": a["name"],
+                    "우선순위": a["prio"], "종목": a["name"], "기준일": s["date"],
                     "현재가": f"{s['price']:,.2f}",
                     "괴리율": f"{s['gap']:+.1f}%", "상태": stt,
                 })
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-            st.caption(f"기준일 {statuses.get('TQQQ', {}).get('date', '-') if statuses.get('TQQQ') else '-'} "
-                       "· BTC는 3% 완충 적용 (200일선 -3%까지 보유 유지)")
+            st.caption("종목별 기준일 표시 · BTC는 3% 완충 적용 (200일선 -3%까지 보유 유지)")
 
     # 백테스트 요약 (참고용 내장값)
     with st.expander("📊 백테스트 요약 (2015.07~2026.08, 참고용)", expanded=False):
         st.dataframe(pd.DataFrame(_ROTATION_BACKTEST), use_container_width=True, hide_index=True)
         st.markdown("""
-- **갈아타기**가 최강 (배수 15.2배, MAR 2.65). 하위 종목 보유 중 상위가 돌파하면 즉시 전환.
-- **TQQQ**가 리스크 대비 가장 효율적 (MAR·Sharpe 우수). **BTC(3%완충)**는 11년 전승. **SOXL**은 절대수익 1위지만 MDD -56%.
+- **갈아타기**가 표 기준 최상위 (배수 15.2배, MAR 2.65). 하위 종목 보유 중 상위가 돌파하면 즉시 전환.
+- 단독 전략 중 **BTC(3%완충)**의 MAR 2.39가 **TQQQ 2.23**보다 높습니다. **SOXL**은 단독 절대수익이 가장 높지만 MDD -56%입니다.
 - **% 손절 금지**: 레버리지 ETF에 -3% 손절 넣으면 수익이 1/4로 축소. 200일선 이탈만이 매도 신호.
 - **종가 기준만**: 장중 이탈로 판단하면 수익 1/16로 축소.
 - 200일선 아래로 내려가도 **55%가 1주 이내, 80%가 1개월 이내** 복귀.
 
-<span style='color:gray'>※ Yahoo Finance 기반, 수수료/세금/환율 미반영. 과거 성과가 미래를 보장하지 않습니다.</span>
+<span style='color:gray'>※ 앱 내 참고용 내장값이며, 이 저장소에는 산식 생성기·기준일 메타데이터가 없어 독립 재현 검증하지 못했습니다. Yahoo Finance 기반, 수수료/세금/환율 미반영. 과거 성과가 미래를 보장하지 않습니다.</span>
         """, unsafe_allow_html=True)
 
 
@@ -2165,7 +2221,8 @@ def render_babytqqq():
     # --- 부분 익절 계산기 ---
     st.markdown("---")
     st.markdown("#### 💰 부분 익절 목표 계산기")
-    st.caption("내 평균 단가를 넣으면 각 익절 단계의 목표가를 알려줘요.")
+    st.caption("내 평균 단가를 넣으면 각 익절 단계의 목표가를 계산합니다. "
+               "실제 매도 이력을 저장하지 않으므로 '도달'은 현재 수익률 기준이며, 이미 실행한 익절 여부는 직접 확인해야 해요.")
     avg_price = st.number_input("내 TQQQ 평균 단가 ($)", min_value=0.0, value=float(round(price, 2)),
                                 step=1.0, key="baby_avg")
     if avg_price > 0:
@@ -2281,12 +2338,13 @@ with tab1.expander("💡 사용법 & 티커 예시", expanded=False):
 - **코인**: `BTC-USD`, `ETH-USD`, `SOL-USD`
 - **한국주식**: `005930.KS`(삼성전자), `035720.KS`(카카오), `247540.KQ`(에코프로비엠) 또는 숫자만 `005930`
 
-**승률 정의 (목표/손절 방식)**: 각 위치에서 매수한 뒤,
-**목표수익(익절)에 먼저 닿으면 승리**, **손절에 먼저 닿으면 패배**로 집계해요.
-최대 보유기간까지 둘 다 안 닿으면 만기 시점 수익률의 부호로 판정합니다.
-- 승률 = 목표수익에 먼저 도달한 비율
-- 평균 수익 = 청산 시 평균 수익률
-- 최대 수익 = 보유 중 평균 최대 도달 수익률
+**전략 성공률 정의 (목표/손절 방식)**: 각 위치에서 매수한 뒤,
+**목표수익에 먼저 닿으면 성공**, **손절에 먼저 닿으면 실패**로 집계해요.
+최대 보유기간까지 둘 다 안 닿으면 만기 수익이 플러스일 때도 성공입니다.
+완전한 최대 보유기간이 남아 있는 과거 진입만 분석합니다.
+- 전략 성공률 = 목표 선도달 또는 만기 양수인 비율
+- 평균 수익 = 목표·손절·만기 청산 시 평균 수익률
+- 평균 최대도달 = 실제 청산일까지 진입별 최대 수익률의 평균
 - 평균 보유 = 청산까지 평균 걸린 거래일수
 
 **구간 폭 vs 완충(중심 간격)**: 구간 폭은 한 행이 커버하는 범위,
@@ -2336,7 +2394,7 @@ with tab1:
   <b>· 🎯 목표수익 (익절)</b> — 매수 후 이 수익률에 <b>먼저</b> 닿으면 <b>승리(익절)</b>로 집계.<br>
   <b>· 🛑 손절</b> — 이 손실률에 <b>먼저</b> 닿으면 <b>패배(손절)</b>로 집계.<br>
   <b>· 최대 보유기간</b> — 목표·손절 둘 다 안 닿으면 이 기간에 만기 청산하고,
-  그 시점 수익률의 부호(+/-)로 승패를 판정해요.
+  그 시점 수익률이 플러스면 성공으로 판정해요. 미래 데이터가 이 기간만큼 온전히 남은 과거 진입만 집계합니다.
 </div>
 """, unsafe_allow_html=True)
 
@@ -2451,7 +2509,7 @@ with tab1:
                 f"(약 {raw_years:.1f}년, {len(raw):,} 거래일)  \n"
                 f"🔎 **분석 구간**: {analysis_start} ~ {last_date} "
                 f"({total_days:,} 거래일) "
-                f"<span style='color:gray'>· 앞 200일은 200일선 계산에 사용되어 분석에서 제외</span>",
+                f"<span style='color:gray'>· 앞 199거래일은 첫 200일선 계산에 사용되어 분석에서 제외</span>",
                 unsafe_allow_html=True)
 
             # --- 즐겨찾기 버튼 ---
@@ -2511,7 +2569,7 @@ with tab1:
                 b1.metric("박스 상단", f"{box['top']:,.2f}")
                 b2.metric("박스 하단", f"{box['bottom']:,.2f}")
                 b3.metric("박스 폭", f"{box['width_pct']:.1f}%")
-                b4.metric("박스 내 위치", f"{box['pos_pct']:.0f}%")
+                b4.metric("박스 기준 위치", f"{box['pos_pct']:.0f}%")
                 if box["is_box"]:
                     st.info(f"📦 **박스권입니다** (최근 {box_days}일 횡보) · {box['status']}  \n"
                             f"상단 **{box['top']:,.2f}** / 하단 **{box['bottom']:,.2f}** "
@@ -2534,29 +2592,31 @@ with tab1:
             if result.empty:
                 st.warning("분석할 데이터가 부족합니다.")
             else:
-                # 현재 위치 = center가 현재 괴리율에 가장 가까운 구간
-                # (슬라이딩이라 현재 gap을 포함하는 구간이 여럿일 수 있음)
-                cur_zone_idx = int((result["center"] - cur_gap).abs().idxmin())
-                cur_center = float(result.iloc[cur_zone_idx]["center"])
+                # 현재 괴리율을 실제로 포함하는 표본 구간 중 가장 가까운 중심만 선택한다.
+                cur_center_key = _match_zone_center(result["center"].tolist(), cur_gap, band_width)
+                if cur_center_key is None:
+                    cur_zone_idx = None
+                    cur_center = None
+                else:
+                    cur_center = float(cur_center_key)
+                    cur_zone_idx = int(result.index[result["center"] == cur_center_key][0])
 
-                st.markdown(f"### 📊 [핵심] 200일선 대비 위치별 승률")
-                # 현재 위치가 표의 매칭 구간에서 멀면(±완충폭 초과) 별도 안내
-                if abs(cur_center - cur_gap) > max(step, band_width / 2):
+                st.markdown(f"### 📊 [핵심] 200일선 대비 위치별 전략 성공률")
+                if cur_zone_idx is None:
                     st.warning(
-                        f"⚠️ 현재 괴리율(**{cur_gap:+.1f}%**)이 과거 표본이 있는 구간을 벗어났어요. "
-                        f"이 종목이 역사적으로 이 위치까지 온 적이 드물어서, 가장 가까운 "
-                        f"**{cur_center:+.0f}%** 구간(표본 {int(result.iloc[cur_zone_idx]['trades'])}건)으로 표시합니다. "
-                        f"참고용으로만 보세요.")
-                st.markdown(f"폭 {band_width}%, 완충 {step}%, 목표 +{target_pct:.0f}% / 손절 -{stop_pct:.0f}% "
-                            f"(먼저 닿는 쪽), 최대보유 {max_hold_choice} 기준 전수조사 결과:  \n"
+                        f"⚠️ 현재 괴리율(**{cur_gap:+.1f}%**)을 포함하면서 과거 표본도 있는 구간이 없어요. "
+                        "가장 가까운 다른 구간으로 강제 대체하지 않으며, 현재 표시와 결론을 생략합니다.")
+                st.markdown(f"폭 {band_width}%, 완충 {step}%, 목표 +{target_pct:.0f}% / 손절 -{stop_pct:.0f}%, "
+                            f"미도달 시 만기 수익 부호 판정, 최대보유 {max_hold_choice} 기준 전수조사 결과:  \n"
                             f"<span style='color:gray'>· '해당 가격'은 현재 200일선({cur_sma:,.2f}) 기준 그 위치 가격이에요.  \n"
-                            f"· <b>승률(목표/손절)</b> = 매수 후 +{target_pct:.0f}% 익절 vs -{stop_pct:.0f}% 손절 중 먼저 닿는 쪽.  \n"
-                            f"· <b>🔼상승추세 / 🔽하락추세</b> = 목표/손절 승률을 <b>추세별로 분리</b> (50일선>200일선=상승추세). "
-                            f"괄호 안은 표본 수. 같은 위치라도 상승추세 눌림목이 하락추세보다 승률이 높은 편이에요.  \n"
-                            f"· <b>승률(200선복귀)</b> = 200일선 <b>아래</b>에서 매수 후 {max_hold_choice} 내 200일선 위로 <b>복귀하면 승리</b> "
-                            f"(아래 구간만 값 있음).  \n"
-                            f"· <b>승률(이탈매도)</b> = 매수 후 종가가 <b>200일선 -5% 아래로 이탈하면 청산</b>, 그때 수익이면 승리 "
-                            f"(아기티큐/네이버 콘텐츠 방식). 200일선 근처에서 낮게 나오는 게 정상이에요(위피소).</span>",
+                            f"· <b>전략 성공률</b> = +{target_pct:.0f}% 목표 선도달, 또는 목표·손절 미도달 시 만기 수익이 플러스인 비율.  \n"
+                            f"· <b>🔼상승추세 / 🔽하락추세</b> = 같은 성공률을 <b>추세별로 분리</b> (50일선>200일선=상승추세). "
+                            f"괄호 안은 각 추세의 표본 수예요.  \n"
+                            f"· <b>200선복귀 성공률</b> = 진입 괴리율 <b>-3% 이하</b>에서 매수 후 {max_hold_choice} 내 "
+                            f"종가가 200일선 위로 복귀한 비율.  \n"
+                            f"· <b>이탈매도 성공률</b> = 진입 당시 -5% 이탈선 위인 표본만 대상으로, "
+                            f"종가가 200일선 -5% 아래로 이탈할 때(미이탈 시 만기) 수익이 플러스인 비율. "
+                            f"모든 전략은 완전한 최대 보유기간이 남은 진입만 집계합니다.</span>",
                             unsafe_allow_html=True)
 
                 # 표시용 DataFrame 구성 (네이티브 st.dataframe → 스크롤 안정)
@@ -2592,7 +2652,9 @@ with tab1:
                         "🔽하락추세": down_v,
                         "🔽표본": down_n if down_n else None,
                         "승률(200선복귀)": _pct_or_dash(row.get("sma_win_rate")),
+                        "200선표본": int(row.get("sma_trades") or 0) or None,
                         "승률(이탈매도)": _pct_or_dash(row.get("breach_win_rate")),
+                        "이탈표본": int(row.get("breach_trades") or 0) or None,
                         "평균수익": float(row["avg_return"]),
                         "최대수익": float(row["max_return"]),
                         "평균보유": int(row["avg_holding_days"]),
@@ -2618,6 +2680,8 @@ with tab1:
                     up_n = "" if pd.isna(r["🔼표본"]) else f'<span class="n">({int(r["🔼표본"])})</span>'
                     dn_txt = _wr_txt(r["🔽하락추세"])
                     dn_n = "" if pd.isna(r["🔽표본"]) else f'<span class="n">({int(r["🔽표본"])})</span>'
+                    sma_n = "" if pd.isna(r["200선표본"]) else f'<span class="n">({int(r["200선표본"])})</span>'
+                    br_n = "" if pd.isna(r["이탈표본"]) else f'<span class="n">({int(r["이탈표본"])})</span>'
                     ar = r["평균수익"]
                     ar_cls = "ret-up" if ar > 0 else ("ret-dn" if ar < 0 else "ret-0")
                     _rows_html.append(
@@ -2629,8 +2693,8 @@ with tab1:
                         f'<td class="{_wr_cls(r["승률(목표/손절)"])}">{_wr_txt(r["승률(목표/손절)"])}</td>'
                         f'<td class="{_wr_cls(r["🔼상승추세"])}">{up_txt}{up_n}</td>'
                         f'<td class="{_wr_cls(r["🔽하락추세"])}">{dn_txt}{dn_n}</td>'
-                        f'<td class="{_wr_cls(r["승률(200선복귀)"])}">{_wr_txt(r["승률(200선복귀)"])}</td>'
-                        f'<td class="{_wr_cls(r["승률(이탈매도)"])}">{_wr_txt(r["승률(이탈매도)"])}</td>'
+                        f'<td class="{_wr_cls(r["승률(200선복귀)"])}">{_wr_txt(r["승률(200선복귀)"])}{sma_n}</td>'
+                        f'<td class="{_wr_cls(r["승률(이탈매도)"])}">{_wr_txt(r["승률(이탈매도)"])}{br_n}</td>'
                         f'<td class="{ar_cls}">{ar:+.1f}%</td>'
                         f'<td class="ret-max">{r["최대수익"]:+.1f}%</td>'
                         f'<td class="dim">{int(r["평균보유"])}일</td>'
@@ -2640,12 +2704,12 @@ with tab1:
                 _head = (
                     '<tr>'
                     '<th>중심위치</th><th>해당가격</th><th>구간</th><th>거래수</th>'
-                    '<th>승률<br><span class="sub">목표/손절</span></th>'
-                    '<th>승률<br><span class="sub">🔼상승</span></th>'
-                    '<th>승률<br><span class="sub">🔽하락</span></th>'
-                    '<th>승률<br><span class="sub">200선복귀</span></th>'
-                    '<th>승률<br><span class="sub">이탈매도</span></th>'
-                    '<th>평균수익</th><th>최대수익</th><th>평균보유</th>'
+                    '<th>성공률<br><span class="sub">목표/손절</span></th>'
+                    '<th>성공률<br><span class="sub">🔼상승</span></th>'
+                    '<th>성공률<br><span class="sub">🔽하락</span></th>'
+                    '<th>성공률<br><span class="sub">200선복귀(n)</span></th>'
+                    '<th>성공률<br><span class="sub">이탈매도(n)</span></th>'
+                    '<th>평균수익</th><th>평균<br><span class="sub">최대도달</span></th><th>평균보유</th>'
                     '</tr>'
                 )
                 st.markdown(
@@ -2655,12 +2719,11 @@ with tab1:
                     unsafe_allow_html=True,
                 )
                 st.caption(
-                    "※ **평균수익·최대수익·평균보유는 모두 '목표/손절' 전략 기준**이에요 "
-                    "(200선복귀·이탈매도 승률과는 별개 계산이라, 서로 다른 전략의 숫자를 직접 비교하면 안 돼요).  \n"
-                    "※ **200선복귀**는 200일선 아래(-)에서 산 경우만 의미가 있어요(위 구간은 '-'가 정상). "
-                    "**이탈매도**가 200일선 한참 위(+구간)에서 승률이 높게 나오면, "
-                    "손절선(200일선 -5%)이 그만큼 멀리 있어서 생기는 착시예요 — 청산까지 큰 하락을 견뎌야 하므로 "
-                    "승률만 보지 말고 평균수익·평균보유를 함께 보세요."
+                    "※ **평균수익·평균 최대도달·평균보유는 모두 목표/손절/만기 전략 기준**입니다. "
+                    "평균 최대도달은 각 진입에서 **진입 시점 0%를 포함해 실제 청산일까지** 기록한 최대 수익률의 평균이에요.  \n"
+                    "※ 200선복귀·이탈매도 셀의 괄호는 각 전략의 별도 표본 수입니다. "
+                    "**200선복귀**는 진입 괴리율 -3% 이하만, **이탈매도**는 진입 당시 -5% 이탈선 위만 집계합니다. "
+                    "따라서 성공률과 표본이 기본 전략과 다르며 평균수익·평균보유를 서로 직접 연결하면 안 됩니다."
                 )
 
                 # --- 현재 위치 결론 ---
@@ -2671,20 +2734,20 @@ with tab1:
                     st.markdown("---")
                     if wr >= 60:
                         st.success(
-                            f"🟢 현재 위치({cur_gap:+.1f}%)에서 매수하면 **목표 도달 확률이 높았어요**. "
-                            f"승률 **{wr:.0f}%**, 평균 청산수익 **{cur_row['avg_return']:+.1f}%**, "
+                            f"🟢 현재 위치({cur_gap:+.1f}%)의 **전략 성공률이 높았어요**. "
+                            f"성공률 **{wr:.0f}%**, 평균 청산수익 **{cur_row['avg_return']:+.1f}%**, "
                             f"평균 보유 **{cur_row['avg_holding_days']}일** ({rule})"
                         )
                     elif wr >= 45:
                         st.warning(
-                            f"🟡 현재 위치({cur_gap:+.1f}%)는 목표·손절이 반반이에요. "
-                            f"승률 **{wr:.0f}%**, 평균 청산수익 **{cur_row['avg_return']:+.1f}%**, "
+                            f"🟡 현재 위치({cur_gap:+.1f}%)의 **전략 성공률은 중간 수준**이에요. "
+                            f"성공률 **{wr:.0f}%**, 평균 청산수익 **{cur_row['avg_return']:+.1f}%**, "
                             f"평균 보유 **{cur_row['avg_holding_days']}일** ({rule})"
                         )
                     else:
                         st.error(
-                            f"🔴 현재 위치({cur_gap:+.1f}%)에서는 **손절 확률이 더 높았어요**. "
-                            f"승률 **{wr:.0f}%**, 평균 청산수익 **{cur_row['avg_return']:+.1f}%**, "
+                            f"🔴 현재 위치({cur_gap:+.1f}%)의 **전략 성공률이 낮았어요**. "
+                            f"성공률 **{wr:.0f}%**, 평균 청산수익 **{cur_row['avg_return']:+.1f}%**, "
                             f"평균 보유 **{cur_row['avg_holding_days']}일** ({rule})"
                         )
 
