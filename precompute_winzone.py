@@ -180,19 +180,32 @@ def get_fx_bond():
     ]
 
 
+def get_indices():
+    """주요 지수 (강세장 필터용). market='IDX'."""
+    return [
+        ("^KS11",  "코스피 지수"),
+        ("^KQ11",  "코스닥 지수"),
+        ("^IXIC",  "나스닥 종합"),
+        ("^GSPC",  "S&P500 지수"),
+    ]
+
+
 def main():
     print("종목 리스트 확보 중...")
     us = get_us_top100()
     kr = get_kr_top100()
     alt = get_alts()
     fxb = get_fx_bond()
-    print(f"  미장 {len(us)}개, 국장 {len(kr)}개, 알트 {len(alt)}개, 환율/국채 {len(fxb)}개")
+    idx = get_indices()
+    print(f"  미장 {len(us)}개, 국장 {len(kr)}개, 알트 {len(alt)}개, "
+          f"환율/국채 {len(fxb)}개, 지수 {len(idx)}개")
 
     result = {}
     all_items = ([(tk, nm, "US") for tk, nm in us]
                  + [(tk, nm, "KR") for tk, nm in kr]
                  + [(tk, nm, "ALT") for tk, nm in alt]
-                 + [(tk, nm, "FXB") for tk, nm in fxb])
+                 + [(tk, nm, "FXB") for tk, nm in fxb]
+                 + [(tk, nm, "IDX") for tk, nm in idx])
 
     for i, (tk, nm, mk) in enumerate(all_items):
         close = load_close(tk)

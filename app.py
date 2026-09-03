@@ -1257,6 +1257,41 @@ def _current_gap(ticker):
     return r["gap"] if r else None
 
 
+# 시장별 대표 지수 (강세장 판단용)
+_MARKET_INDEX = {
+    "KR": ["^KS11", "^KQ11"],        # 국장: 코스피/코스닥
+    "US": ["^GSPC", "^IXIC"],        # 미국: S&P500/나스닥
+}
+
+
+def _market_is_bull(market, min_wr=60):
+    """해당 시장이 강세장인지: 대표 지수가 200일선 위 + 현재 위치 승률 min_wr%↑.
+    Returns (강세여부, 설명리스트)."""
+    idxs = _MARKET_INDEX.get(market, [])
+    if not idxs:
+        return True, []  # 판단 지수 없으면 통과 (알트/환율 등)
+    details = []
+    bull_any = False
+    for ix in idxs:
+        v = WINZONE_DATA.get(ix)
+        r = _ds_status(ix)
+        if not v or not r:
+            continue
+        gap = r["gap"]
+        cur_wr, _ = _winzone_lookup(ix, gap, "target")
+        wr_num = None
+        if cur_wr != "-":
+            try:
+                wr_num = float(cur_wr.split("%")[0])
+            except Exception:
+                wr_num = None
+        is_bull = r["above"] and (wr_num is not None and wr_num >= min_wr)
+        if is_bull:
+            bull_any = True
+        details.append(f"{v['name']}: {gap:+.1f}% ({'위' if r['above'] else '아래'}), 승률 {cur_wr}")
+    return bull_any, details
+
+
 def render_winzone_catcher():
     st.subheader("🎯 승률 포착기")
     st.caption("미장·국장 대형주 200종목 중, 지금 위치가 역사적으로 고승률이었던 종목을 찾아줍니다.")
@@ -1289,14 +1324,33 @@ def render_winzone_catcher():
     with c2:
         market_filter = st.selectbox("시장", ["전체", "미국", "국장", "알트", "환율/국채"], index=0)
 
+    bull_only = st.checkbox(
+        "🐂 강세장 필터 (지수 200일선 위 + 지수 승률 60%↑ 시장의 200일선 위 종목만)",
+        value=False, key="winzone_bull",
+        help="시장 지수가 강세일 때, 그 시장에서 200일선 위이면서 승률이 임계값 이상인 종목만 봅니다. "
+             "코스피/코스닥은 국장, S&P500/나스닥은 미국 시장 판단에 사용돼요.")
+
     if not st.button("🔍 승률 포착 스캔", type="primary", key="winzone_scan"):
         st.info("버튼을 눌러 지금 고승률 구간에 있는 종목을 찾아보세요. "
                 f"(200종목+ 현재가 확인, 20~40초 소요)")
         return
 
     mkmap = {"미국": "US", "국장": "KR", "알트": "ALT", "환율/국채": "FXB"}
+    # 지수(IDX)는 종목이 아니라 시장 판단용이므로 스캔 대상에서 제외
     targets = [(tk, v) for tk, v in WINZONE_DATA.items()
-               if market_filter == "전체" or v["market"] == mkmap.get(market_filter)]
+               if v["market"] != "IDX"
+               and (market_filter == "전체" or v["market"] == mkmap.get(market_filter))]
+
+    # 강세장 필터: 각 시장의 강세 여부를 미리 판정
+    bull_status = {}
+    if bull_only:
+        for mk in ("US", "KR"):
+            is_bull, details = _market_is_bull(mk, min_wr=60)
+            bull_status[mk] = is_bull
+        # 강세장 상태 안내
+        kr_txt = "🟢 강세" if bull_status.get("KR") else "🔴 약세"
+        us_txt = "🟢 강세" if bull_status.get("US") else "🔴 약세"
+        st.markdown(f"**시장 상태** — 국장(코스피/코스닥): {kr_txt} · 미국(S&P/나스닥): {us_txt}")
 
     zones_key = "zones_sma" if mode == "sma" else "zones"
     hits = []
@@ -1308,6 +1362,12 @@ def render_winzone_catcher():
         if not r:
             continue
         gap = r["gap"]
+        # 강세장 필터: 시장이 강세이고, 종목이 200일선 위일 때만
+        if bull_only:
+            if not bull_status.get(v["market"], False):
+                continue  # 이 종목 시장이 약세면 제외
+            if gap < 0:
+                continue  # 200일선 아래면 제외 (강세장 = 위 종목만)
         # 200일선 복귀 모드는 200일선 아래(-3% 이하)에서만 의미 있음
         if mode == "sma" and gap > -3:
             continue
