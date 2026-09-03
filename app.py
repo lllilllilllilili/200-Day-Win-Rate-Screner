@@ -732,6 +732,63 @@ def _ds_status(ticker):
             "signal": signal, "rsi": rsi}
 
 
+def detect_box(df: pd.DataFrame, lookback: int = 60, tol: float = 0.03):
+    """
+    최근 lookback일 가격으로 박스권(횡보 구간)을 자동 탐지.
+    박스권 판정: 최근 구간의 (고점-저점)/중앙값 범위가 좁고, 종가가 그 안에서 횡보.
+
+    Returns dict:
+      is_box: 박스권 여부
+      top, bottom: 박스 상단/하단
+      width_pct: 박스 폭 (%)
+      pos_pct: 현재가의 박스 내 위치 (0=하단, 100=상단)
+      status: 상태 문자열
+    """
+    if df is None or len(df) < lookback + 5:
+        return None
+    close = df["Close"].values[-lookback:]
+    cur = float(df["Close"].iloc[-1])
+
+    hi = float(np.max(close))
+    lo = float(np.min(close))
+    mid = (hi + lo) / 2
+    if mid <= 0:
+        return None
+    width_pct = (hi - lo) / mid * 100
+
+    # 박스권 조건: 최근 구간 폭이 좁음(예: 25% 이내) + 추세가 뚜렷하지 않음
+    # 추세 판정: 구간을 반으로 나눠 평균 차이가 작으면 횡보
+    half = lookback // 2
+    first_avg = float(np.mean(close[:half]))
+    second_avg = float(np.mean(close[half:]))
+    trend_pct = abs(second_avg - first_avg) / mid * 100
+
+    is_box = width_pct <= 25 and trend_pct <= 8
+
+    # 현재가의 박스 내 위치 (0~100)
+    pos_pct = (cur - lo) / (hi - lo) * 100 if hi > lo else 50
+
+    # 상태 판정
+    if cur > hi * (1 + tol):
+        status = "🟢 박스 상단 돌파 (매수 신호 가능)"
+    elif cur < lo * (1 - tol):
+        status = "🔴 박스 하단 이탈 (매도/이탈)"
+    elif pos_pct >= 80:
+        status = "🔵 박스 상단 근처 (돌파 대기)"
+    elif pos_pct <= 20:
+        status = "🟡 박스 하단 근처 (지지 테스트)"
+    else:
+        status = "⚪ 박스 중간"
+
+    return {
+        "is_box": is_box,
+        "top": hi, "bottom": lo, "mid": mid,
+        "width_pct": width_pct, "trend_pct": trend_pct,
+        "pos_pct": pos_pct, "cur": cur, "status": status,
+        "lookback": lookback,
+    }
+
+
 @st.cache_data(ttl=3600, show_spinner=False, max_entries=60)
 def get_fundamentals(ticker):
     """단일 종목의 밸류에이션+재무건전성 지표를 yfinance .info에서 실시간 조회.
@@ -2279,6 +2336,31 @@ with tab1:
                            "yfinance 실시간 값이며 결측일 수 있어요. 투자 권유가 아닙니다.")
             else:
                 st.caption("💼 이 종목은 밸류에이션·재무 지표를 제공하지 않아요 (코인/지수/환율 등).")
+
+            # --- 박스권 자동 탐지 ---
+            st.markdown("#### 📦 박스권 자동 탐지")
+            box_days = st.selectbox("탐지 기간", [40, 60, 90, 120], index=1, key="box_days",
+                                    format_func=lambda x: f"최근 {x}일")
+            box = detect_box(df, lookback=box_days)
+            if box is None:
+                st.caption("데이터가 부족해 박스권을 탐지할 수 없어요.")
+            else:
+                b1, b2, b3, b4 = st.columns(4)
+                b1.metric("박스 상단", f"{box['top']:,.2f}")
+                b2.metric("박스 하단", f"{box['bottom']:,.2f}")
+                b3.metric("박스 폭", f"{box['width_pct']:.1f}%")
+                b4.metric("박스 내 위치", f"{box['pos_pct']:.0f}%")
+                if box["is_box"]:
+                    st.info(f"📦 **박스권입니다** (최근 {box_days}일 횡보) · {box['status']}  \n"
+                            f"상단 **{box['top']:,.2f}** / 하단 **{box['bottom']:,.2f}** "
+                            f"(폭 {box['width_pct']:.1f}%). 현재가는 박스 내 {box['pos_pct']:.0f}% 지점.")
+                else:
+                    st.warning(f"↗️ **박스권이 아니에요** (추세 진행 중, 최근 {box_days}일 방향성 {box['trend_pct']:.1f}%). "
+                               f"{box['status']} · 최근 고점 {box['top']:,.2f} / 저점 {box['bottom']:,.2f}")
+                st.caption("· 박스권 = 좁은 범위 횡보 (폭 25%↓ + 방향성 8%↓). "
+                           "· 상단 돌파는 매수 신호, 하단 이탈은 매도 신호로 해석돼요. "
+                           "· 과거 데이터 기반이며 투자 권유가 아닙니다.")
+
             st.markdown(f"🎯 목표 **+{target_pct:.0f}%** / 🛑 손절 **-{stop_pct:.0f}%** | "
                         f"최대보유: **{max_hold_choice}** | "
                         f"구간 폭: **{band_width}%** / 완충: **{step}%**")
