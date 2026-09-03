@@ -91,64 +91,7 @@ def remove_favorite(ticker: str):
 def is_favorite(ticker: str) -> bool:
     return any(f.get("ticker") == ticker for f in get_favorites())
 
-# -- Custom CSS for dark table styling --
-st.markdown("""
-<style>
-.position-wrap {
-    overflow-x: auto;
-    -webkit-overflow-scrolling: touch;
-    border-radius: 10px;
-    border: 1px solid #2b2f36;
-    margin-top: 14px;
-}
-.position-table {
-    width: 100%;
-    border-collapse: collapse;
-    font-family: 'Pretendard', -apple-system, sans-serif;
-    font-size: 13px;
-    white-space: nowrap;
-}
-.position-table th {
-    text-align: center;
-    padding: 10px 10px;
-    background: #1a1d23;
-    border-bottom: 2px solid #3a3f47;
-    color: #cbd2d9;
-    font-weight: 600;
-    font-size: 12px;
-    line-height: 1.35;
-}
-.position-table td {
-    padding: 8px 10px;
-    border-bottom: 1px solid #262a30;
-    text-align: center;
-    color: #d0d4d9;
-}
-/* 왼쪽 3개(위치/가격/구간)는 좌측 정렬 */
-.position-table td:nth-child(1),
-.position-table td:nth-child(2),
-.position-table td:nth-child(3) { text-align: left; }
-/* 홀짝 줄무늬 */
-.position-table tbody tr:nth-child(even) td { background: rgba(255,255,255,0.02); }
-.position-table tbody tr:hover td { background: rgba(96,165,250,0.08); }
-/* 승률 그룹(5~9열)에 옅은 배경으로 구획 */
-.position-table td:nth-child(n+5):nth-child(-n+9),
-.position-table th:nth-child(n+5):nth-child(-n+9) {
-    background: rgba(255,255,255,0.015);
-}
-.position-table tr.current-row td {
-    background: rgba(59, 130, 246, 0.22) !important;
-    font-weight: 700;
-    color: #93c5fd;
-    box-shadow: inset 3px 0 0 #3b82f6;
-}
-.win-high { color: #34d399; font-weight: 700; }
-.win-mid { color: #fbbf24; font-weight: 600; }
-.win-low { color: #f87171; }
-.pos-price { color: #9aa4af; font-variant-numeric: tabular-nums; }
-.pos-samp { font-size: 10px; color: #6b7280; }
-</style>
-""", unsafe_allow_html=True)
+
 
 # ------------------------------------------------------------
 # 데이터 로딩
@@ -2571,92 +2514,88 @@ with tab1:
                             f"(아기티큐/네이버 콘텐츠 방식). 200일선 근처에서 낮게 나오는 게 정상이에요(위피소).</span>",
                             unsafe_allow_html=True)
 
-                # HTML 테이블 생성 (가로 스크롤 wrap)
-                _sub = 'font-size:11px;color:#7a828c;font-weight:400'
-                html = '<div class="position-wrap"><table class="position-table">'
-                html += f"""<tr>
-                    <th>중심<br><span style="{_sub}">위치</span></th>
-                    <th>해당<br><span style="{_sub}">가격</span></th>
-                    <th>구간</th>
-                    <th>거래<br><span style="{_sub}">수</span></th>
-                    <th>승률<br><span style="{_sub}">목표/손절</span></th>
-                    <th>승률<br><span style="{_sub}">🔼상승추세</span></th>
-                    <th>승률<br><span style="{_sub}">🔽하락추세</span></th>
-                    <th>승률<br><span style="{_sub}">200선복귀</span></th>
-                    <th>승률<br><span style="{_sub}">이탈매도</span></th>
-                    <th>평균수익<br><span style="{_sub}">목표/손절</span></th>
-                    <th>최대수익<br><span style="{_sub}">보유중고점</span></th>
-                    <th>평균보유<br><span style="{_sub}">목표/손절</span></th>
-                </tr>"""
+                # 표시용 DataFrame 구성 (네이티브 st.dataframe → 스크롤 안정)
+                def _pct_or_dash(v, n=None):
+                    if v is None or (isinstance(v, float) and pd.isna(v)):
+                        return None
+                    if n is not None and int(n or 0) == 0:
+                        return None
+                    return float(v)
 
+                disp_rows = []
                 for i, row in result.iterrows():
                     is_current = (i == cur_zone_idx)
-                    row_class = ' class="current-row"' if is_current else ''
-
-                    # 승률 색상
-                    wr = row["win_rate"]
-                    if wr >= 60:
-                        wr_cls = "win-high"
-                    elif wr >= 45:
-                        wr_cls = "win-mid"
-                    else:
-                        wr_cls = "win-low"
-
                     center_label = f"{row['center']:+.0f}%"
                     if abs(row["center"]) < 0.01:
                         center_label = "0% (200일선)"
+                    if is_current:
+                        center_label += " ◀ 현재"
 
-                    marker = " ◀ 현재" if is_current else ""
+                    up_v = _pct_or_dash(row.get("up_win_rate"), row.get("up_trades"))
+                    up_n = int(row.get("up_trades") or 0)
+                    down_v = _pct_or_dash(row.get("down_win_rate"), row.get("down_trades"))
+                    down_n = int(row.get("down_trades") or 0)
 
-                    # 중심 위치에 해당하는 가격 = 현재 200일선 × (1 + center%/100)
-                    zone_price = cur_sma * (1 + row["center"] / 100)
+                    disp_rows.append({
+                        "중심위치": center_label,
+                        "해당가격": cur_sma * (1 + row["center"] / 100),
+                        "구간": row["zone_label"],
+                        "거래수": int(row["trades"]),
+                        "승률(목표/손절)": float(row["win_rate"]),
+                        "🔼상승추세": up_v,
+                        "🔼표본": up_n if up_n else None,
+                        "🔽하락추세": down_v,
+                        "🔽표본": down_n if down_n else None,
+                        "승률(200선복귀)": _pct_or_dash(row.get("sma_win_rate")),
+                        "승률(이탈매도)": _pct_or_dash(row.get("breach_win_rate")),
+                        "평균수익": float(row["avg_return"]),
+                        "최대수익": float(row["max_return"]),
+                        "평균보유": int(row["avg_holding_days"]),
+                    })
 
-                    # 200일선 복귀 승률 (아래 구간만 값 있음)
-                    swr = row.get("sma_win_rate")
-                    if swr is None or (isinstance(swr, float) and pd.isna(swr)):
-                        sma_cell = '<span style="color:#555">-</span>'
-                    else:
-                        s_cls = "win-high" if swr >= 60 else ("win-mid" if swr >= 45 else "win-low")
-                        sma_cell = f'<span class="{s_cls}">{swr:.0f}%</span>'
+                disp_df = pd.DataFrame(disp_rows)
 
-                    # 200일선 이탈매도 승률 (콘텐츠 방식)
-                    bwr = row.get("breach_win_rate")
-                    if bwr is None or (isinstance(bwr, float) and pd.isna(bwr)):
-                        breach_cell = '<span style="color:#555">-</span>'
-                    else:
-                        b_cls = "win-high" if bwr >= 60 else ("win-mid" if bwr >= 45 else "win-low")
-                        breach_cell = f'<span class="{b_cls}">{bwr:.0f}%</span>'
+                # 승률 색상 (Styler)
+                def _wr_color(v):
+                    if v is None or pd.isna(v):
+                        return "color:#555"
+                    if v >= 60:
+                        return "color:#34d399;font-weight:600"
+                    if v >= 45:
+                        return "color:#fbbf24"
+                    return "color:#f87171"
 
-                    # 추세별 승률 셀 (표본 있을 때만, 표본 수 툴팁)
-                    def _trend_cell(wr_key, n_key):
-                        v = row.get(wr_key)
-                        nn = int(row.get(n_key) or 0)
-                        if v is None or (isinstance(v, float) and pd.isna(v)) or nn == 0:
-                            return '<span style="color:#555">-</span>'
-                        c = "win-high" if v >= 60 else ("win-mid" if v >= 45 else "win-low")
-                        return f'<span class="{c}">{v:.0f}%</span><span style="font-size:10px;color:#666"> ({nn})</span>'
-                    up_cell = _trend_cell("up_win_rate", "up_trades")
-                    down_cell = _trend_cell("down_win_rate", "down_trades")
+                def _ret_color(v):
+                    if v is None or pd.isna(v):
+                        return "color:#9aa4af"
+                    return "color:#34d399" if v > 0 else ("color:#f87171" if v < 0 else "color:#9aa4af")
 
-                    ar = row['avg_return']
-                    ar_color = "#34d399" if ar > 0 else ("#f87171" if ar < 0 else "#9aa4af")
-                    html += f"""<tr{row_class}>
-                        <td>{center_label}{marker}</td>
-                        <td class="pos-price">{zone_price:,.2f}</td>
-                        <td style="color:#9aa4af">{row['zone_label']}</td>
-                        <td>{row['trades']:,}</td>
-                        <td class="{wr_cls}">{wr:.0f}%</td>
-                        <td>{up_cell}</td>
-                        <td>{down_cell}</td>
-                        <td>{sma_cell}</td>
-                        <td>{breach_cell}</td>
-                        <td style="color:{ar_color}">{ar:+.1f}%</td>
-                        <td style="color:#60a5fa">{row['max_return']:+.1f}%</td>
-                        <td class="pos-samp" style="font-size:12px">{row['avg_holding_days']}일</td>
-                    </tr>"""
+                def _highlight_current(s):
+                    styles = []
+                    for val in disp_df["중심위치"]:
+                        styles.append("background-color:rgba(96,165,250,0.15)" if "◀ 현재" in str(val) else "")
+                    return styles
 
-                html += "</table></div>"
-                st.markdown(html, unsafe_allow_html=True)
+                wr_cols = ["승률(목표/손절)", "🔼상승추세", "🔽하락추세", "승률(200선복귀)", "승률(이탈매도)"]
+                sty = (disp_df.style
+                       .map(_wr_color, subset=wr_cols)
+                       .map(_ret_color, subset=["평균수익"])
+                       .apply(_highlight_current, subset=["중심위치"])
+                       .format({
+                           "해당가격": "{:,.2f}",
+                           "승률(목표/손절)": lambda v: "-" if pd.isna(v) else f"{v:.0f}%",
+                           "🔼상승추세": lambda v: "-" if pd.isna(v) else f"{v:.0f}%",
+                           "🔽하락추세": lambda v: "-" if pd.isna(v) else f"{v:.0f}%",
+                           "승률(200선복귀)": lambda v: "-" if pd.isna(v) else f"{v:.0f}%",
+                           "승률(이탈매도)": lambda v: "-" if pd.isna(v) else f"{v:.0f}%",
+                           "평균수익": lambda v: "-" if pd.isna(v) else f"{v:+.1f}%",
+                           "최대수익": lambda v: "-" if pd.isna(v) else f"{v:+.1f}%",
+                           "🔼표본": lambda v: "" if pd.isna(v) else f"{int(v)}",
+                           "🔽표본": lambda v: "" if pd.isna(v) else f"{int(v)}",
+                           "평균보유": "{}일",
+                       }))
+
+                st.dataframe(sty, width='stretch', hide_index=True, height=560)
 
                 # --- 현재 위치 결론 ---
                 if cur_zone_idx is not None:
