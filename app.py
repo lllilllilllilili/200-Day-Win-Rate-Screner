@@ -1416,7 +1416,12 @@ def render_winzone_catcher():
                 "매칭 구간": f"{int(best_center):+d}%",
                 "역사적 승률": f"{wr:.0f}%",
                 "표본": f"{samples}건",
+                # 정렬/필터용 숨은 숫자값
                 "_wr": wr,
+                "_gap": gap,
+                "_rsi": r.get("rsi") if r.get("rsi") is not None else float("nan"),
+                "_samples": samples,
+                "_vscore": vscore if vscore is not None else float("nan"),
             })
     prog.empty()
 
@@ -1426,10 +1431,54 @@ def render_winzone_catcher():
                    "임계값을 낮추거나 나중에 다시 확인해 보세요.")
         return
 
-    hits.sort(key=lambda x: -x["_wr"])
-    df_hits = pd.DataFrame([{k: v for k, v in h.items() if k != "_wr"} for h in hits])
     st.success(f"🎯 지금 승률 {threshold}% 이상 구간에 있는 종목: **{len(hits)}개**")
-    st.dataframe(df_hits, use_container_width=True, hide_index=True)
+
+    # --- 정렬 / 필터 위젯 ---
+    df_full = pd.DataFrame(hits)
+    with st.expander("🔧 정렬 · 필터", expanded=True):
+        fc1, fc2, fc3 = st.columns(3)
+        with fc1:
+            sort_by = st.selectbox("정렬 기준",
+                                   ["역사적 승률", "현재 괴리율", "RSI", "표본", "고평가 점수"],
+                                   index=0, key="wz_sort")
+            sort_desc = st.checkbox("내림차순", value=True, key="wz_sort_desc")
+        with fc2:
+            gmin, gmax = float(df_full["_gap"].min()), float(df_full["_gap"].max())
+            if gmin < gmax:
+                gap_range = st.slider("현재 괴리율(%) 범위", gmin, gmax, (gmin, gmax), key="wz_gap")
+            else:
+                gap_range = (gmin, gmax)
+            min_samples = st.number_input("최소 표본 수", min_value=0,
+                                          value=0, step=10, key="wz_minsamp")
+        with fc3:
+            # RSI 범위 (결측 제외 옵션 고려)
+            rsi_valid = df_full["_rsi"].dropna()
+            if len(rsi_valid) > 0:
+                rlo, rhi = int(rsi_valid.min()), int(rsi_valid.max())
+                rsi_range = st.slider("RSI 범위", 0, 100, (rlo, rhi), key="wz_rsi")
+            else:
+                rsi_range = (0, 100)
+            only_undervalued = st.checkbox("고평가 제외 (저평가·적정만)",
+                                           value=False, key="wz_undervalued")
+
+    # 필터 적용
+    f = df_full.copy()
+    f = f[(f["_gap"] >= gap_range[0]) & (f["_gap"] <= gap_range[1])]
+    f = f[f["_samples"] >= min_samples]
+    # RSI 필터 (결측은 유지)
+    f = f[f["_rsi"].isna() | ((f["_rsi"] >= rsi_range[0]) & (f["_rsi"] <= rsi_range[1]))]
+    if only_undervalued:
+        f = f[f["_vscore"].isna() | (f["_vscore"] < 70)]
+
+    # 정렬
+    sort_col = {"역사적 승률": "_wr", "현재 괴리율": "_gap", "RSI": "_rsi",
+                "표본": "_samples", "고평가 점수": "_vscore"}[sort_by]
+    f = f.sort_values(sort_col, ascending=not sort_desc, na_position="last")
+
+    st.caption(f"필터 결과: **{len(f)}개** (전체 {len(df_full)}개 중)")
+    # 표시용 컬럼만 (숨은 숫자값 제거)
+    show_cols = [c for c in f.columns if not c.startswith("_")]
+    st.dataframe(f[show_cols], use_container_width=True, hide_index=True)
 
     st.caption("· '매칭 구간'은 현재 괴리율과 가장 가까운 사전계산 구간이에요. "
                "· 승률은 사전 백테스트(Yahoo Finance 전체 기간) 내장값이며 계산 시점 기준입니다. "
