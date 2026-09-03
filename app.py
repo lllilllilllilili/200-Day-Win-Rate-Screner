@@ -2311,6 +2311,11 @@ with tab1:
     resolved_name = None
     proceed = run
 
+    # 버튼을 눌렀으면 이번 조회 티커를 기억(session_state).
+    # 이후 박스권 기간 등 다른 위젯을 바꿔 rerun돼도 마지막 조회 결과가 유지됨.
+    if run:
+        st.session_state["_wz_run"] = True
+
     should_search_kr = run and ticker and (_has_korean(ticker) or not _looks_like_ticker(ticker))
 
     if should_search_kr:
@@ -2345,8 +2350,23 @@ with tab1:
             # 영문인데 못 찾음 -> 해외 티커일 수 있으니 원본 그대로 yfinance 시도
             # (resolved_ticker 는 원본 유지, proceed 도 run 값 그대로)
 
+    # 조회가 확정되면 최종 티커/이름을 session_state에 저장.
     if proceed and resolved_ticker:
-        ticker = resolved_ticker  # 이후 로직은 변환된 티커 사용
+        st.session_state["_wz_ticker"] = resolved_ticker
+        st.session_state["_wz_name"] = resolved_name
+    # 이번에 확정됐거나(proceed), 이전에 조회한 게 있으면(session_state) 결과 표시.
+    # 단, 한글 후보 선택 대기 중(should_search_kr True + proceed False)이면 새 조회 시도이므로 제외.
+    use_ticker = None
+    use_name = None
+    if proceed and resolved_ticker:
+        use_ticker, use_name = resolved_ticker, resolved_name
+    elif not run and not (should_search_kr and not proceed) and st.session_state.get("_wz_ticker"):
+        use_ticker = st.session_state["_wz_ticker"]
+        use_name = st.session_state.get("_wz_name")
+
+    if use_ticker:
+        ticker = use_ticker  # 이후 로직은 확정된 티커 사용
+        resolved_name = use_name
         with st.spinner(f"{ticker} 데이터 로딩 중..."):
             raw = load_prices(ticker)
 
