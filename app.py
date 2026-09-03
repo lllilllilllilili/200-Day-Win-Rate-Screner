@@ -331,7 +331,7 @@ def prepare(df: pd.DataFrame) -> pd.DataFrame:
 
 def zone_analysis(df: pd.DataFrame, band_width: float, step: float,
                   target_pct: float, stop_pct: float, max_hold: int,
-                  zone_min: float = -50, zone_max: float = 50) -> pd.DataFrame:
+                  zone_min: float = -50, zone_max: float = 100) -> pd.DataFrame:
     """
     200일선 괴리율을 슬라이딩 구간으로 나누고,
     각 구간에서 매수 후 "목표수익 도달 vs 손절 중 먼저 닿는 것"으로 성과를 전수조사.
