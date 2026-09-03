@@ -94,43 +94,60 @@ def is_favorite(ticker: str) -> bool:
 # -- Custom CSS for dark table styling --
 st.markdown("""
 <style>
+.position-wrap {
+    overflow-x: auto;
+    border-radius: 10px;
+    border: 1px solid #2b2f36;
+    margin-top: 14px;
+}
 .position-table {
     width: 100%;
     border-collapse: collapse;
     font-family: 'Pretendard', -apple-system, sans-serif;
-    font-size: 14px;
-    margin-top: 16px;
+    font-size: 13px;
+    white-space: nowrap;
 }
 .position-table th {
-    text-align: left;
-    padding: 8px 12px;
-    border-bottom: 2px solid #444;
-    color: #aaa;
+    text-align: center;
+    padding: 10px 10px;
+    background: #1a1d23;
+    border-bottom: 2px solid #3a3f47;
+    color: #cbd2d9;
     font-weight: 600;
+    font-size: 12px;
+    line-height: 1.35;
+    position: sticky;
+    top: 0;
 }
 .position-table td {
-    padding: 7px 12px;
-    border-bottom: 1px solid #333;
+    padding: 8px 10px;
+    border-bottom: 1px solid #262a30;
+    text-align: center;
+    color: #d0d4d9;
 }
-.position-table tr.current-row {
-    background: rgba(59, 130, 246, 0.2);
-    border-left: 3px solid #3b82f6;
+/* 왼쪽 3개(위치/가격/구간)는 좌측 정렬 */
+.position-table td:nth-child(1),
+.position-table td:nth-child(2),
+.position-table td:nth-child(3) { text-align: left; }
+/* 홀짝 줄무늬 */
+.position-table tbody tr:nth-child(even) td { background: rgba(255,255,255,0.02); }
+.position-table tbody tr:hover td { background: rgba(96,165,250,0.08); }
+/* 승률 그룹(5~9열)에 옅은 배경으로 구획 */
+.position-table td:nth-child(n+5):nth-child(-n+9),
+.position-table th:nth-child(n+5):nth-child(-n+9) {
+    background: rgba(255,255,255,0.015);
 }
 .position-table tr.current-row td {
+    background: rgba(59, 130, 246, 0.22) !important;
     font-weight: 700;
-    color: #60a5fa;
+    color: #93c5fd;
+    box-shadow: inset 3px 0 0 #3b82f6;
 }
-.win-high { color: #34d399; font-weight: 600; }
-.win-mid { color: #fbbf24; }
+.win-high { color: #34d399; font-weight: 700; }
+.win-mid { color: #fbbf24; font-weight: 600; }
 .win-low { color: #f87171; }
-.metric-box {
-    border: 1px solid #444;
-    border-radius: 8px;
-    padding: 16px;
-    text-align: center;
-}
-.metric-box .value { font-size: 28px; font-weight: 700; }
-.metric-box .label { font-size: 12px; color: #999; margin-top: 4px; }
+.pos-price { color: #9aa4af; font-variant-numeric: tabular-nums; }
+.pos-samp { font-size: 10px; color: #6b7280; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -2555,21 +2572,22 @@ with tab1:
                             f"(아기티큐/네이버 콘텐츠 방식). 200일선 근처에서 낮게 나오는 게 정상이에요(위피소).</span>",
                             unsafe_allow_html=True)
 
-                # HTML 테이블 생성
-                html = '<table class="position-table">'
-                html += """<tr>
-                    <th>중심 위치</th>
-                    <th>해당 가격</th>
+                # HTML 테이블 생성 (가로 스크롤 wrap)
+                _sub = 'font-size:11px;color:#7a828c;font-weight:400'
+                html = '<div class="position-wrap"><table class="position-table">'
+                html += f"""<tr>
+                    <th>중심<br><span style="{_sub}">위치</span></th>
+                    <th>해당<br><span style="{_sub}">가격</span></th>
                     <th>구간</th>
-                    <th>거래수</th>
-                    <th>승률<br><span style="font-size:11px;color:#888">목표/손절</span></th>
-                    <th>승률<br><span style="font-size:11px;color:#888">🔼상승추세</span></th>
-                    <th>승률<br><span style="font-size:11px;color:#888">🔽하락추세</span></th>
-                    <th>승률<br><span style="font-size:11px;color:#888">200선복귀</span></th>
-                    <th>승률<br><span style="font-size:11px;color:#888">이탈매도</span></th>
-                    <th>평균 수익</th>
-                    <th>최대 수익</th>
-                    <th>평균 보유</th>
+                    <th>거래<br><span style="{_sub}">수</span></th>
+                    <th>승률<br><span style="{_sub}">목표/손절</span></th>
+                    <th>승률<br><span style="{_sub}">🔼상승추세</span></th>
+                    <th>승률<br><span style="{_sub}">🔽하락추세</span></th>
+                    <th>승률<br><span style="{_sub}">200선복귀</span></th>
+                    <th>승률<br><span style="{_sub}">이탈매도</span></th>
+                    <th>평균수익<br><span style="{_sub}">목표/손절</span></th>
+                    <th>최대수익<br><span style="{_sub}">보유중고점</span></th>
+                    <th>평균보유<br><span style="{_sub}">목표/손절</span></th>
                 </tr>"""
 
                 for i, row in result.iterrows():
@@ -2621,22 +2639,24 @@ with tab1:
                     up_cell = _trend_cell("up_win_rate", "up_trades")
                     down_cell = _trend_cell("down_win_rate", "down_trades")
 
+                    ar = row['avg_return']
+                    ar_color = "#34d399" if ar > 0 else ("#f87171" if ar < 0 else "#9aa4af")
                     html += f"""<tr{row_class}>
                         <td>{center_label}{marker}</td>
-                        <td>{zone_price:,.2f}</td>
-                        <td>{row['zone_label']}</td>
-                        <td>{row['trades']}</td>
+                        <td class="pos-price">{zone_price:,.2f}</td>
+                        <td style="color:#9aa4af">{row['zone_label']}</td>
+                        <td>{row['trades']:,}</td>
                         <td class="{wr_cls}">{wr:.0f}%</td>
                         <td>{up_cell}</td>
                         <td>{down_cell}</td>
                         <td>{sma_cell}</td>
                         <td>{breach_cell}</td>
-                        <td>{row['avg_return']:+.1f}%</td>
-                        <td>{row['max_return']:+.1f}%</td>
-                        <td>{row['avg_holding_days']}일</td>
+                        <td style="color:{ar_color}">{ar:+.1f}%</td>
+                        <td style="color:#60a5fa">{row['max_return']:+.1f}%</td>
+                        <td class="pos-samp" style="font-size:12px">{row['avg_holding_days']}일</td>
                     </tr>"""
 
-                html += "</table>"
+                html += "</table></div>"
                 st.markdown(html, unsafe_allow_html=True)
 
                 # --- 현재 위치 결론 ---
