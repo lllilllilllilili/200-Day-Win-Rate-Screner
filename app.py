@@ -17,6 +17,51 @@ from datetime import datetime
 
 st.set_page_config(page_title="200일선 승률 스크리너", page_icon="📈", layout="wide")
 
+# 위치별 승률 정적 테이블 스타일 (내부 스크롤 컨테이너 없음 = 모바일 스크롤 멈춤 방지)
+st.markdown("""
+<style>
+.posbox { margin-top: 12px; }
+.postbl {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+    table-layout: fixed;
+}
+.postbl th, .postbl td {
+    padding: 6px 4px;
+    border-bottom: 1px solid #262a30;
+    text-align: center;
+    color: #d0d4d9;
+    word-break: keep-all;
+}
+.postbl th {
+    background: #1a1d23;
+    color: #cbd2d9;
+    font-weight: 600;
+    font-size: 11px;
+    line-height: 1.3;
+}
+.postbl th .sub { font-size: 10px; color: #7a828c; font-weight: 400; }
+.postbl td.lft { text-align: left; }
+.postbl td.dim { color: #9aa4af; }
+.postbl td.price { color: #9aa4af; font-variant-numeric: tabular-nums; }
+.postbl td .n { font-size: 10px; color: #6b7280; }
+.postbl tr.cur td {
+    background: rgba(59,130,246,0.20);
+    font-weight: 700;
+    box-shadow: inset 3px 0 0 #3b82f6;
+}
+.postbl td.wr-hi { color: #34d399; font-weight: 600; }
+.postbl td.wr-mid { color: #fbbf24; }
+.postbl td.wr-lo { color: #f87171; }
+.postbl td.wr-na { color: #555; }
+.postbl td.ret-up { color: #34d399; }
+.postbl td.ret-dn { color: #f87171; }
+.postbl td.ret-0 { color: #9aa4af; }
+.postbl td.ret-max { color: #60a5fa; }
+</style>
+""", unsafe_allow_html=True)
+
 # 승률 포착기 사전계산 데이터 (JSON 로딩 — .py 파싱보다 가볍고 안정적)
 try:
     import json as _wz_json, os as _wz_os
@@ -2555,47 +2600,60 @@ with tab1:
 
                 disp_df = pd.DataFrame(disp_rows)
 
-                # 승률 색상 (Styler)
-                def _wr_color(v):
+                # 정적 HTML 테이블 (내부 스크롤 컨테이너 없음 → 모바일 터치 스크롤 충돌 방지)
+                # 셀마다 인라인 스타일 대신 CSS 클래스만 붙여 HTML을 가볍게 유지
+                def _wr_cls(v):
                     if v is None or pd.isna(v):
-                        return "color:#555"
-                    if v >= 60:
-                        return "color:#34d399;font-weight:600"
-                    if v >= 45:
-                        return "color:#fbbf24"
-                    return "color:#f87171"
+                        return "wr-na"
+                    return "wr-hi" if v >= 60 else ("wr-mid" if v >= 45 else "wr-lo")
 
-                def _ret_color(v):
-                    if v is None or pd.isna(v):
-                        return "color:#9aa4af"
-                    return "color:#34d399" if v > 0 else ("color:#f87171" if v < 0 else "color:#9aa4af")
+                def _wr_txt(v):
+                    return "-" if (v is None or pd.isna(v)) else f"{v:.0f}%"
 
-                def _highlight_current(s):
-                    styles = []
-                    for val in disp_df["중심위치"]:
-                        styles.append("background-color:rgba(96,165,250,0.15)" if "◀ 현재" in str(val) else "")
-                    return styles
+                _rows_html = []
+                for _, r in disp_df.iterrows():
+                    is_cur = "◀ 현재" in str(r["중심위치"])
+                    tr_cls = ' class="cur"' if is_cur else ""
+                    up_txt = _wr_txt(r["🔼상승추세"])
+                    up_n = "" if pd.isna(r["🔼표본"]) else f'<span class="n">({int(r["🔼표본"])})</span>'
+                    dn_txt = _wr_txt(r["🔽하락추세"])
+                    dn_n = "" if pd.isna(r["🔽표본"]) else f'<span class="n">({int(r["🔽표본"])})</span>'
+                    ar = r["평균수익"]
+                    ar_cls = "ret-up" if ar > 0 else ("ret-dn" if ar < 0 else "ret-0")
+                    _rows_html.append(
+                        f'<tr{tr_cls}>'
+                        f'<td class="lft">{r["중심위치"]}</td>'
+                        f'<td class="lft price">{r["해당가격"]:,.2f}</td>'
+                        f'<td class="lft dim">{r["구간"]}</td>'
+                        f'<td>{int(r["거래수"]):,}</td>'
+                        f'<td class="{_wr_cls(r["승률(목표/손절)"])}">{_wr_txt(r["승률(목표/손절)"])}</td>'
+                        f'<td class="{_wr_cls(r["🔼상승추세"])}">{up_txt}{up_n}</td>'
+                        f'<td class="{_wr_cls(r["🔽하락추세"])}">{dn_txt}{dn_n}</td>'
+                        f'<td class="{_wr_cls(r["승률(200선복귀)"])}">{_wr_txt(r["승률(200선복귀)"])}</td>'
+                        f'<td class="{_wr_cls(r["승률(이탈매도)"])}">{_wr_txt(r["승률(이탈매도)"])}</td>'
+                        f'<td class="{ar_cls}">{ar:+.1f}%</td>'
+                        f'<td class="ret-max">{r["최대수익"]:+.1f}%</td>'
+                        f'<td class="dim">{int(r["평균보유"])}일</td>'
+                        f'</tr>'
+                    )
 
-                wr_cols = ["승률(목표/손절)", "🔼상승추세", "🔽하락추세", "승률(200선복귀)", "승률(이탈매도)"]
-                sty = (disp_df.style
-                       .map(_wr_color, subset=wr_cols)
-                       .map(_ret_color, subset=["평균수익"])
-                       .apply(_highlight_current, subset=["중심위치"])
-                       .format({
-                           "해당가격": "{:,.2f}",
-                           "승률(목표/손절)": lambda v: "-" if pd.isna(v) else f"{v:.0f}%",
-                           "🔼상승추세": lambda v: "-" if pd.isna(v) else f"{v:.0f}%",
-                           "🔽하락추세": lambda v: "-" if pd.isna(v) else f"{v:.0f}%",
-                           "승률(200선복귀)": lambda v: "-" if pd.isna(v) else f"{v:.0f}%",
-                           "승률(이탈매도)": lambda v: "-" if pd.isna(v) else f"{v:.0f}%",
-                           "평균수익": lambda v: "-" if pd.isna(v) else f"{v:+.1f}%",
-                           "최대수익": lambda v: "-" if pd.isna(v) else f"{v:+.1f}%",
-                           "🔼표본": lambda v: "" if pd.isna(v) else f"{int(v)}",
-                           "🔽표본": lambda v: "" if pd.isna(v) else f"{int(v)}",
-                           "평균보유": "{}일",
-                       }))
-
-                st.dataframe(sty, width='stretch', hide_index=True, height=560)
+                _head = (
+                    '<tr>'
+                    '<th>중심위치</th><th>해당가격</th><th>구간</th><th>거래수</th>'
+                    '<th>승률<br><span class="sub">목표/손절</span></th>'
+                    '<th>승률<br><span class="sub">🔼상승</span></th>'
+                    '<th>승률<br><span class="sub">🔽하락</span></th>'
+                    '<th>승률<br><span class="sub">200선복귀</span></th>'
+                    '<th>승률<br><span class="sub">이탈매도</span></th>'
+                    '<th>평균수익</th><th>최대수익</th><th>평균보유</th>'
+                    '</tr>'
+                )
+                st.markdown(
+                    '<div class="posbox"><table class="postbl">'
+                    + _head + "".join(_rows_html)
+                    + "</table></div>",
+                    unsafe_allow_html=True,
+                )
 
                 # --- 현재 위치 결론 ---
                 if cur_zone_idx is not None:
