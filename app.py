@@ -1399,6 +1399,11 @@ def render_winzone_catcher():
         if wr >= threshold:
             mk_emoji = {"US": "🇺🇸", "KR": "🇰🇷", "ALT": "🪙", "FXB": "💱"}.get(v["market"], "")
             position = "🔴 위" if gap >= 0 else "🟢 아래"
+            # 고평가 점수/등급 (밸류에이션, 없으면 '-')
+            val = v.get("val") or {}
+            vscore = val.get("score")
+            vgrade = val.get("grade", "-")
+            valuation = f"{vgrade} ({vscore})" if vscore is not None else "-"
             hits.append({
                 "종목": v["name"],
                 "티커": tk,
@@ -1407,6 +1412,7 @@ def render_winzone_catcher():
                 "이격": f"{abs(gap):.1f}%",
                 "현재 괴리율": f"{gap:+.1f}%",
                 "RSI": _fmt_rsi(r.get("rsi")),
+                "고평가": valuation,
                 "매칭 구간": f"{int(best_center):+d}%",
                 "역사적 승률": f"{wr:.0f}%",
                 "표본": f"{samples}건",
@@ -1427,6 +1433,8 @@ def render_winzone_catcher():
 
     st.caption("· '매칭 구간'은 현재 괴리율과 가장 가까운 사전계산 구간이에요. "
                "· 승률은 사전 백테스트(Yahoo Finance 전체 기간) 내장값이며 계산 시점 기준입니다. "
+               "· '고평가'는 PER·PBR·PSR을 같은 시장 내에서 상대 순위로 종합한 점수(0~100, 높을수록 고평가)예요. "
+               "밸류에이션 결측 종목·지수/코인/환율은 '-'로 표시됩니다. "
                "· 표본이 적은 구간은 신뢰도가 낮을 수 있어요. 과거 성과가 미래를 보장하지 않습니다.")
 
 

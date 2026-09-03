@@ -39,6 +39,28 @@ def load_close(ticker):
         return None
 
 
+def fetch_valuation(ticker):
+    """yfinance .info에서 밸류에이션 지표 수집. 결측은 None.
+    Returns {per, pbr, psr, div} (div=배당수익률%)."""
+    try:
+        info = yf.Ticker(ticker).info
+    except Exception:
+        return {"per": None, "pbr": None, "psr": None, "div": None}
+
+    def g(*keys):
+        for k in keys:
+            v = info.get(k)
+            if v is not None and isinstance(v, (int, float)) and v == v and v > 0:
+                return float(v)
+        return None
+
+    return {
+        "per": g("trailingPE", "forwardPE"),
+        "pbr": g("priceToBook"),
+        "psr": g("priceToSalesTrailing12Months"),
+    }
+
+
 def zone_winrates(close: np.ndarray):
     """구간별 승률을 두 방식으로 계산해 (zones_target, zones_sma) 반환.
 
@@ -190,6 +212,57 @@ def get_indices():
     ]
 
 
+def _compute_valuation_scores(result):
+    """수집된 밸류에이션을 시장(US/KR) 내 상대순위로 고평가 점수(0~100)+등급 계산.
+    PER/PBR/PSR 높을수록 고평가(↑), 배당수익률 높을수록 저평가(↓).
+    각 지표 퍼센타일 평균 → 점수. 각 종목 entry['val']에 score/grade 추가."""
+    import numpy as _np
+
+    for market in ("US", "KR"):
+        items = [(tk, v) for tk, v in result.items()
+                 if v.get("market") == market and v.get("val")]
+        if len(items) < 5:
+            continue
+
+        # 지표별 값 배열 (결측 제외하고 퍼센타일 계산용)
+        metrics = {"per": [], "pbr": [], "psr": []}
+        for _, v in items:
+            for m in metrics:
+                val = v["val"].get(m)
+                if val is not None:
+                    metrics[m].append(val)
+
+        def pct_rank(val, arr):
+            """arr 내 val의 퍼센타일(0~100). 높을수록 고평가."""
+            if val is None or not arr:
+                return None
+            arr_sorted = sorted(arr)
+            below = sum(1 for x in arr_sorted if x < val)
+            return below / len(arr_sorted) * 100
+
+        for tk, v in items:
+            val = v["val"]
+            parts = []
+            for m in ("per", "pbr", "psr"):
+                p = pct_rank(val.get(m), metrics[m])
+                if p is not None:
+                    parts.append(p)
+
+            if parts:
+                score = round(float(_np.mean(parts)), 0)
+                if score >= 70:
+                    grade = "🔴 고평가"
+                elif score >= 40:
+                    grade = "🟡 적정"
+                else:
+                    grade = "🟢 저평가"
+                val["score"] = int(score)
+                val["grade"] = grade
+            else:
+                val["score"] = None
+                val["grade"] = "-"
+
+
 def main():
     print("종목 리스트 확보 중...")
     us = get_us_top100()
@@ -214,11 +287,18 @@ def main():
             continue
         zones_t, zones_s = zone_winrates(close.values.astype(float))
         if zones_t or zones_s:
-            result[tk] = {"name": nm, "market": mk,
-                          "zones": zones_t, "zones_sma": zones_s}
+            entry = {"name": nm, "market": mk,
+                     "zones": zones_t, "zones_sma": zones_s}
+            # 주식(US/KR)만 밸류에이션 수집 (지수/환율/국채/코인은 의미 없음)
+            if mk in ("US", "KR"):
+                entry["val"] = fetch_valuation(tk)
+            result[tk] = entry
         print(f"  [{i+1}/{len(all_items)}] {tk} {nm}: "
               f"목표/손절 {len(zones_t)}구간, 200선복귀 {len(zones_s)}구간")
         time.sleep(0.05)
+
+    # --- 밸류에이션 상대순위 → 고평가 점수(0~100) 계산 ---
+    _compute_valuation_scores(result)
 
     # winzone_data.py 로 저장 (호환성 유지)
     with open("winzone_data.py", "w", encoding="utf-8") as f:
