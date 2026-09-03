@@ -619,7 +619,33 @@ def _crash_indicators():
         out.append(("S&P500 vs 200일선", f"{pct:+.1f}%", stt, score,
                     "200일선 이탈 = 하락 추세, 기관 매도 트리거"))
 
+    # 하이일드 신용 스프레드 (FRED, '스마트 머니'가 가장 먼저 반응)
+    hy = _hy_spread()
+    if hy is not None:
+        bp = hy * 100  # % -> bp
+        if bp >= 800: score, stt = 100, "점등"
+        elif bp >= 500: score, stt = 80, "점등"
+        elif bp >= 450: score, stt = 55, "경계"
+        elif bp >= 400: score, stt = 35, "경계"
+        else: score, stt = 15, "정상"
+        out.append(("하이일드 스프레드", f"{bp:.0f}bp", stt, score,
+                    "500bp+ 확대 = 신용시장 공포, 주식보다 2~4주 선행"))
+
     return out
+
+
+@st.cache_data(ttl=3600, show_spinner=False, max_entries=1)
+def _hy_spread():
+    """FRED 하이일드 스프레드(%) 최근값. 실패 시 None."""
+    try:
+        import pandas_datareader.data as web
+        from datetime import datetime as _dt, timedelta as _td
+        df = web.DataReader("BAMLH0A0HYM2", "fred",
+                            _dt.now() - _td(days=30), _dt.now())
+        df = df.dropna()
+        return float(df.iloc[-1, 0]) if len(df) else None
+    except Exception:
+        return None
 
 
 def render_crash_scanner():
@@ -655,12 +681,55 @@ def render_crash_scanner():
     box(f"**종합 위험도 {overall}/100 [{level}]** · 점등 {lit} / 경계 {caution} / 정상 {normal}  \n권고: {rec}")
 
     mark = {"점등": "🔴", "경계": "🟡", "정상": "🟢"}
+    st.markdown("#### 📡 자동 점등 지표 (실시간)")
     table = pd.DataFrame([{
         "지표": name, "값": val, "상태": f"{mark.get(stt,'⚪')} {stt}",
         "점수": score, "설명": desc,
     } for name, val, stt, score, desc in inds])
     st.dataframe(table, use_container_width=True, hide_index=True)
     st.caption("⚠️ 일부 매크로 지표는 시장 데이터 기반 근사치입니다. 참고용이며 투자 권유가 아닙니다.")
+
+    # --- 확인 체크리스트 (자동화 어려운 매크로 지표: 링크+기준) ---
+    with st.expander("📋 추가 확인 지표 체크리스트 (수동 확인)", expanded=False):
+        st.markdown("""
+자동 계산이 어려운 매크로 지표들이에요. 아래 링크에서 직접 확인하세요.
+과거 대형 폭락(2000·2008·2022) 전엔 이런 지표가 **9~10개 동시 점등**됐어요.
+
+| 지표 | 점등 기준 | 확인 |
+|---|---|---|
+| **버핏 지표** (시총/GDP) | 200%↑ 위험 (장기평균 88%) | [gurufocus](https://www.gurufocus.com/stock-market-valuations.php) |
+| **쉴러 CAPE** | 30↑ 고평가, 40↑ 닷컴급 | [multpl](https://www.multpl.com/shiller-pe) |
+| **내부자 매도** | 여러 기업 동시 대량 매도(클러스터) | [openinsider](http://openinsider.com) |
+| **ISM 제조업 PMI** | 50 하회 (특히 45↓) | [FRED MANEMP](https://fred.stlouisfed.org/series/MANEMP) |
+| **소비자 신뢰지수** | 전월비 -10%↑ 급락 | [FRED UMCSENT](https://fred.stlouisfed.org/series/UMCSENT) |
+| **마진 부채** | 사상 최고 후 감소 전환 | [FINRA](https://www.finra.org/investors/learn-to-invest/advanced-investing/margin-statistics) |
+| **연준 사이클** | 마지막 인상 후 6~18개월 (최고 위험) | [FRED FEDFUNDS](https://fred.stlouisfed.org/series/FEDFUNDS) |
+| **"이번엔 다르다" 내러티브** | 미디어·개인 낙관 만연, IPO 열풍 | 정성적 판단 |
+        """)
+
+    # --- 3단계 대응 매뉴얼 ---
+    with st.expander("🛡️ 경고 점등 시 대응 매뉴얼", expanded=False):
+        st.markdown("""
+**점등 개수별 3단계 대응**
+
+| 단계 | 점등 수 | 행동 |
+|---|---|---|
+| 1단계 (관찰) | 3~4개 | 신규 매수 속도 ↓, 현금 5~10% 확보 |
+| 2단계 (경계) | 5~7개 | 레버리지 해제, 현금 20~30%, 방어주 확대 |
+| 3단계 (방어) | 8개↑ | 주식 50%↓, 장기국채(TLT)·금(GLD) 편입 |
+
+**절대 금지**: 공포에 전량 매도 · 레버리지 추가 · 한 종목 올인
+**반드시**: 현금 확보 · 분할매수 계획(-10/-20/-30%) · 손절 라인 사전 설정
+
+**⏱️ 이것만 보면 되는 3가지** (동시 점등 시 진짜 하락장 확률↑)
+1. **하이일드 스프레드** 급등 (스마트머니 2~4주 선행)
+2. **S&P500 200일선 이탈** (추세 붕괴)
+3. **VIX 30 돌파** (패닉 진입 = 역발상 매수 대기)
+
+<span style='color:gray'>· 구조적 폭락은 미리 보이지만(9~10개 점등), 외부충격(코로나 등)은 예측 불가.
+· 지표 하나로 판단 말고 '합류'를 보세요. 타이밍보다 비중 조절이 정답.
+· 과거 데이터 기반이며 투자 권유가 아닙니다.</span>
+        """, unsafe_allow_html=True)
 
 
 # ============================================================
