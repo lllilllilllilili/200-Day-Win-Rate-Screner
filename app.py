@@ -403,16 +403,18 @@ def zone_analysis(df: pd.DataFrame, band_width: float, step: float,
             sma_has[pos] = True
             sma_win[pos] = bool((path > fut_sma).any())
 
-        # 200일선 이탈 매도 (콘텐츠 방식): 종가가 200일선×(1-완충) 아래로 이탈하면 청산
-        fut_sma_b = sma[pos + 1:end + 1]
-        sell_line = fut_sma_b * (1 - BR_BUFFER)
-        breached = np.where(path < sell_line)[0]
-        br_has[pos] = True
-        if breached.size > 0:
-            d = int(breached[0])
-            br_win[pos] = bool(path[d] > entry)  # 이탈 청산가가 진입가보다 높으면 승리
-        else:
-            br_win[pos] = bool(path[-1] > entry)  # 만기까지 안 이탈 → 만기가 진입가보다 높으면 승리
+        # 200일선 이탈 매도 (콘텐츠 방식): 종가가 200일선×(1-완충) 아래로 이탈하면 청산.
+        # 단, 매수 시점에 이미 이탈선(-완충%) 아래이면 계산 제외 (매수 즉시 청산 = 무의미한 반등매매).
+        if gap[pos] > -BR_BUFFER * 100:
+            fut_sma_b = sma[pos + 1:end + 1]
+            sell_line = fut_sma_b * (1 - BR_BUFFER)
+            breached = np.where(path < sell_line)[0]
+            br_has[pos] = True
+            if breached.size > 0:
+                d = int(breached[0])
+                br_win[pos] = bool(path[d] > entry)  # 이탈 청산가가 진입가보다 높으면 승리
+            else:
+                br_win[pos] = bool(path[-1] > entry)  # 만기까지 안 이탈 → 만기가 진입가보다 높으면 승리
 
     valid = ~np.isnan(exit_ret)  # 결과가 있는 진입 시점
 
