@@ -684,6 +684,16 @@ def _ds_status(ticker):
         return None
     data = data.copy()
     data["MA200"] = data["Close"].rolling(200).mean()
+
+    # RSI(14) — Wilder 방식 (EMA 평활)
+    delta = data["Close"].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
+    rs = avg_gain / avg_loss
+    data["RSI"] = 100 - (100 / (1 + rs))
+
     data = data.dropna(subset=["MA200"])
     if len(data) < 2:
         return None
@@ -692,12 +702,26 @@ def _ds_status(ticker):
     pclose = float(data["Close"].iloc[-2])
     pma = float(data["MA200"].iloc[-2])
     gap = (close / ma - 1) * 100
+    rsi_val = data["RSI"].iloc[-1]
+    rsi = float(rsi_val) if pd.notna(rsi_val) else None
     signal = "-"
     if pclose <= pma and close > ma:
         signal = "🟢 BUY (돌파)"
     elif pclose >= pma and close < ma:
         signal = "🔴 SELL (이탈)"
-    return {"close": close, "ma": ma, "gap": gap, "above": close > ma, "signal": signal}
+    return {"close": close, "ma": ma, "gap": gap, "above": close > ma,
+            "signal": signal, "rsi": rsi}
+
+
+def _fmt_rsi(rsi):
+    """RSI 값을 상태 라벨과 함께 문자열로. (과매도<30, 과매수>70)"""
+    if rsi is None:
+        return "-"
+    if rsi >= 70:
+        return f"{rsi:.0f} 🔴과매수"
+    if rsi <= 30:
+        return f"{rsi:.0f} 🟢과매도"
+    return f"{rsi:.0f}"
 
 
 def _ds_table(items):
@@ -712,6 +736,7 @@ def _ds_table(items):
         rows.append({
             "종목": name, "종가": f"{r['close']:,.2f}",
             "괴리율": f"{r['gap']:+.1f}%", "위/아래": "위" if r["above"] else "아래",
+            "RSI": _fmt_rsi(r.get("rsi")),
             "신호": r["signal"],
         })
     return pd.DataFrame(rows)
@@ -829,6 +854,7 @@ def render_kr_winzone():
             in_zone_rows.append({
                 "종목": name, "타입": typ,
                 "현재 괴리율": f"{gap:+.1f}%",
+                "RSI": _fmt_rsi(r.get("rsi")),
                 "현재 매수구간": f"-{zone}%",
                 "구간 승률": f"{wr}%",
                 "최고 승률 구간": best_str,
@@ -845,6 +871,7 @@ def render_kr_winzone():
             above_rows.append({
                 "종목": name, "타입": typ,
                 "현재 괴리율": f"{gap:+.1f}%",
+                "RSI": _fmt_rsi(r.get("rsi")),
                 "현재 위치": f"200일선 {pos}",
                 "최고 승률 구간": best_str,
                 "상태": status,
@@ -926,6 +953,7 @@ def render_us_winzone():
             below_rows.append({
                 "종목": name,
                 "현재 괴리율": f"{gap:+.1f}%",
+                "RSI": _fmt_rsi(r.get("rsi")),
                 "구간 승률": cur_wr,
                 "최고 승률 구간": best_wr,
                 "복귀 기간": recov,
@@ -936,6 +964,7 @@ def render_us_winzone():
             above_rows.append({
                 "종목": name,
                 "현재 괴리율": f"{gap:+.1f}%",
+                "RSI": _fmt_rsi(r.get("rsi")),
                 "구간 승률": cur_wr,
                 "최고 승률 구간": best_wr,
                 "복귀 기간": recov,
@@ -998,6 +1027,7 @@ def render_alt_winzone():
         rows.append({
             "코인": name,
             "현재 괴리율": f"{gap:+.1f}%",
+            "RSI": _fmt_rsi(r.get("rsi")),
             "구간 승률": cur_wr,
             "최고 승률 구간": best_wr,
             "상태": status,
@@ -1036,6 +1066,7 @@ def render_fxb_winzone():
         rows.append({
             "종목": name,
             "현재 괴리율": f"{gap:+.1f}%",
+            "RSI": _fmt_rsi(r.get("rsi")),
             "구간 승률": cur_wr,
             "최고 승률 구간": best_wr,
             "상태": status,
@@ -1067,11 +1098,12 @@ def render_favorites_section():
         r = _ds_status(ticker)
         if not r:
             rows.append({"종목": name, "종가": "-",
-                         "괴리율": "-", "위/아래": "-", "신호": "데이터 없음"})
+                         "괴리율": "-", "위/아래": "-", "RSI": "-", "신호": "데이터 없음"})
             continue
         rows.append({
             "종목": name, "종가": f"{r['close']:,.2f}",
             "괴리율": f"{r['gap']:+.1f}%", "위/아래": "위" if r["above"] else "아래",
+            "RSI": _fmt_rsi(r.get("rsi")),
             "신호": r["signal"],
         })
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
@@ -1272,9 +1304,10 @@ def render_winzone_catcher():
     total = len(targets)
     for i, (tk, v) in enumerate(targets):
         prog.progress((i + 1) / total)
-        gap = _current_gap(tk)
-        if gap is None:
+        r = _ds_status(tk)
+        if not r:
             continue
+        gap = r["gap"]
         # 200일선 복귀 모드는 200일선 아래(-3% 이하)에서만 의미 있음
         if mode == "sma" and gap > -3:
             continue
@@ -1294,6 +1327,7 @@ def render_winzone_catcher():
                 "200일선": position,
                 "이격": f"{abs(gap):.1f}%",
                 "현재 괴리율": f"{gap:+.1f}%",
+                "RSI": _fmt_rsi(r.get("rsi")),
                 "매칭 구간": f"{int(best_center):+d}%",
                 "역사적 승률": f"{wr:.0f}%",
                 "표본": f"{samples}건",
@@ -1341,7 +1375,7 @@ def render_sector_rotation():
                 r = _ds_status(tk)
                 if not r:
                     rows.append({"섹터": name, "ETF": tk, "현재가": "-",
-                                 "200일선": "-", "괴리율": "-", "상태": "데이터 없음"})
+                                 "괴리율": "-", "RSI": "-", "상태": "데이터 없음"})
                     continue
                 stt = "🟢 200일선 위" if r["above"] else "🔴 200일선 아래"
                 if r["signal"] != "-":
@@ -1349,7 +1383,8 @@ def render_sector_rotation():
                 rows.append({
                     "섹터": name, "ETF": tk,
                     "현재가": f"{r['close']:,.2f}",
-                    "괴리율": f"{r['gap']:+.1f}%", "상태": stt,
+                    "괴리율": f"{r['gap']:+.1f}%",
+                    "RSI": _fmt_rsi(r.get("rsi")), "상태": stt,
                 })
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
