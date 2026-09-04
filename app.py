@@ -2520,6 +2520,7 @@ with tab1:
             cur_gap = float(df["gap"].iloc[-1])
             cur_price = float(df["Close"].iloc[-1])
             cur_sma = float(df["SMA200"].iloc[-1])
+            cur_rsi = _rsi_wilder(raw["Close"])
             last_date = df.index[-1].strftime("%Y-%m-%d")
             total_days = len(df)
             raw_start = raw.index[0].strftime("%Y-%m-%d")   # 원본 데이터 시작일
@@ -2535,7 +2536,8 @@ with tab1:
             c2.metric("현재가", f"{cur_price:,.2f}")
             c3.metric("200일선", f"{cur_sma:,.2f}")
             gap_display = f"{cur_gap:+.1f}%"
-            c4.metric("200일선 대비", gap_display)
+            c4.metric("200일선 대비", gap_display, help=f"RSI(14): {_fmt_rsi(cur_rsi)}")
+            st.caption(f"📉 RSI(14): **{_fmt_rsi(cur_rsi)}** (70↑ 과매수 · 30↓ 과매도)")
 
             # --- 현재 추세 (50일선 vs 200일선) ---
             cur_sma50 = float(df["SMA50"].iloc[-1]) if "SMA50" in df.columns else None
