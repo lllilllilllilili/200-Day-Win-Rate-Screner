@@ -156,6 +156,32 @@ def _has_korean(text: str) -> bool:
     return any("\uac00" <= ch <= "\ud7a3" for ch in text)
 
 
+def _kr_ticker(code: str, market: str = None) -> str:
+    """국내 종목코드에 시장별 yfinance 접미사를 붙인다.
+
+    코스닥 종목을 '.KS'로 조회하면 yfinance가 동일 코드의 다른 상품(펀드 등)에
+    매칭돼 재무 지표가 비어버리므로, 시장을 확인해 '.KQ'를 붙여야 한다.
+    """
+    code = str(code).strip().upper()
+    code = code.replace(".KS", "").replace(".KQ", "")
+    mk = market
+    if mk is None:
+        listing = load_krx_listing()
+        if not listing.empty:
+            hit = listing[listing["Code"].astype(str) == code]
+            if len(hit):
+                mk = str(hit.iloc[0]["Market"])
+    return f"{code}.KQ" if (mk and "KOSDAQ" in mk.upper()) else f"{code}.KS"
+
+
+def _normalize_kr_code(text: str) -> str:
+    """'038500' 또는 '038500.KS'처럼 직접 입력한 국내 코드의 접미사를 시장에 맞게 교정."""
+    import re
+    s = text.strip().upper()
+    m = re.fullmatch(r"(\d{6})(\.K[SQ])?", s)
+    return _kr_ticker(m.group(1)) if m else text
+
+
 # 영문 약자 → 한글 발음 별칭.
 # 상장명에 영문 약자가 섞여 있어(예: 'NAVER', 'SK하이닉스') 한글 발음으로
 # 검색할 때 매칭되도록, 검색어의 한글 발음을 영문 약자로 되돌려 준다.
@@ -960,12 +986,15 @@ def get_fundamentals(ticker):
         return None
 
     per = num("trailingPE", "forwardPE")
+    # 국내 종목은 trailingPE가 비고 forwardPE만 오는 경우가 많아 구분해 표시한다.
+    per_forward = per is not None and not isinstance(info.get("trailingPE"), (int, float))
     pbr = num("priceToBook")
     psr = num("priceToSalesTrailing12Months")
     roe = num("returnOnEquity")            # 소수 (0.15 = 15%)
     dte = num("debtToEquity")              # % 또는 배수 (yfinance는 보통 % 단위, 예: 150 = 150%)
     opm = num("operatingMargins")          # 소수 (0.25 = 25%)
-    return {"per": per, "pbr": pbr, "psr": psr, "roe": roe, "dte": dte, "opm": opm}
+    return {"per": per, "pbr": pbr, "psr": psr, "roe": roe, "dte": dte, "opm": opm,
+            "per_forward": per_forward}
 
 
 def _fmt_valuation(f):
@@ -982,7 +1011,7 @@ def _fmt_valuation(f):
             tag = "🔴높음" if per >= 30 else ("🟡보통" if per >= 15 else "🟢낮음")
             if per >= 30:
                 flags.append(1)
-        details.append(("PER", f"{per:.1f}", tag))
+        details.append(("PER(예상)" if f.get("per_forward") else "PER", f"{per:.1f}", tag))
     if pbr is not None:
         tag = "🔴높음" if pbr >= 5 else ("🟡보통" if pbr >= 1.5 else "🟢낮음")
         if pbr >= 5:
@@ -2407,7 +2436,8 @@ with tab1:
     run = st.button("🔍 전수조사", type="primary", use_container_width=True)
 
     # --- 한글 기업명 → 종목코드 자동 변환 ---
-    resolved_ticker = ticker.strip() if ticker else ""
+    # 숫자 6자리 국내 코드는 시장에 맞는 접미사(.KS/.KQ)로 교정해 둔다.
+    resolved_ticker = _normalize_kr_code(ticker) if ticker else ""
     resolved_name = None
     proceed = run
 
@@ -2424,7 +2454,8 @@ with tab1:
 
         if kind == "code":
             code, name = payload, rest[0]
-            resolved_ticker = f"{code}.KS"  # yfinance/FDR 공용, FDR은 접미사 제거해서 사용
+            # 코스피/코스닥에 맞는 접미사를 붙인다 (FDR은 접미사를 제거해서 사용)
+            resolved_ticker = _kr_ticker(code)
             resolved_name = name
             st.info(f"🇰🇷 '{ticker}' → **{name} ({code})** 로 변환했어요.")
         elif kind == "candidates":
@@ -2435,8 +2466,8 @@ with tab1:
             # 선택 확정 버튼
             if st.button("✅ 이 종목으로 조회", key="confirm_candidate"):
                 idx = options.index(chosen)
-                code, name, _ = cands[idx]
-                resolved_ticker = f"{code}.KS"
+                code, name, market = cands[idx]
+                resolved_ticker = _kr_ticker(code, market)
                 resolved_name = name
                 proceed = True
             else:
@@ -2561,7 +2592,9 @@ with tab1:
                            "· ROE≥15%·부채비율<100%·영업이익률≥20% = 우수. "
                            "yfinance 실시간 값이며 결측일 수 있어요. 투자 권유가 아닙니다.")
             else:
-                st.caption("💼 이 종목은 밸류에이션·재무 지표를 제공하지 않아요 (코인/지수/환율 등).")
+                st.caption(f"💼 `{fav_ticker}`의 밸류에이션·재무 지표를 받지 못했어요. "
+                           "코인·지수·환율은 원래 해당 지표가 없고, 개별 종목이라면 "
+                           "yfinance가 그 종목 재무를 제공하지 않는 경우예요.")
 
             # --- 박스권 자동 탐지 ---
             st.markdown("#### 📦 박스권 자동 탐지")
