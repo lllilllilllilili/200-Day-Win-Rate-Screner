@@ -555,6 +555,21 @@ def _load_btc_mvrv():
         return None
 
 
+def _rsi_wilder(close: pd.Series, period: int = 14):
+    """종가 시리즈의 최신 RSI(Wilder EMA 방식). 값이 없으면 None."""
+    if close is None or len(close) < period + 1:
+        return None
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    last = rsi.iloc[-1]
+    return float(last) if pd.notna(last) else None
+
+
 def _mvrv_zone(v):
     if v is None or not np.isfinite(v):
         return None
@@ -581,6 +596,7 @@ def render_crypto_screener():
                 continue
             d = raw.copy()
             d["SMA200"] = d["Close"].rolling(200).mean()
+            rsi = _rsi_wilder(d["Close"])
             d = d.dropna()
             price = float(d["Close"].iloc[-1])
             sma = float(d["SMA200"].iloc[-1])
@@ -590,7 +606,7 @@ def render_crypto_screener():
             rows.append({
                 "자산": asset['short'], "현재가": price, "200일선": sma,
                 "괴리율": gap, "위/아래": "위" if above else "아래",
-                "매도선": sell_line, "이탈": price < sell_line,
+                "매도선": sell_line, "이탈": price < sell_line, "rsi": rsi,
             })
 
     if not rows:
@@ -618,6 +634,7 @@ def render_crypto_screener():
         "현재가": f"{r['현재가']:,.2f}",
         "괴리율": f"{r['괴리율']:+.1f}%",
         "위/아래": r["위/아래"],
+        "RSI": _fmt_rsi(r.get("rsi")),
         "매도선(6%완충)": f"{r['매도선']:,.2f}",
         "상태": "🚨 이탈" if r["이탈"] else ("✅ 위" if r["위/아래"] == "위" else "⏸️ 아래"),
     } for r in rows])
@@ -882,15 +899,7 @@ def _ds_status(ticker):
         return None
     data = data.copy()
     data["MA200"] = data["Close"].rolling(200).mean()
-
-    # RSI(14) — Wilder 방식 (EMA 평활)
-    delta = data["Close"].diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
-    rs = avg_gain / avg_loss
-    data["RSI"] = 100 - (100 / (1 + rs))
+    rsi = _rsi_wilder(data["Close"])
 
     data = data.dropna(subset=["MA200"])
     if len(data) < 2:
@@ -900,8 +909,6 @@ def _ds_status(ticker):
     pclose = float(data["Close"].iloc[-2])
     pma = float(data["MA200"].iloc[-2])
     gap = (close / ma - 1) * 100
-    rsi_val = data["RSI"].iloc[-1]
-    rsi = float(rsi_val) if pd.notna(rsi_val) else None
     signal = "-"
     if pclose <= pma and close > ma:
         signal = "🟢 BUY (돌파)"
@@ -2094,6 +2101,7 @@ def _rotation_status(ticker, buffer):
         return None
     d = raw.copy()
     d["SMA200"] = d["Close"].rolling(200).mean()
+    rsi = _rsi_wilder(d["Close"])
     d = d.dropna()
     if len(d) < 1:
         return None
@@ -2106,6 +2114,7 @@ def _rotation_status(ticker, buffer):
         "above": price > sma,
         "holdable": price >= sell_line,  # 완충 감안 보유 유지 가능
         "sell_line": sell_line,
+        "rsi": rsi,
         "date": d.index[-1].strftime("%Y-%m-%d"),
     }
 
@@ -2155,8 +2164,8 @@ def render_rotation():
             for a in _ROTATION_ASSETS:
                 s = statuses.get(a["ticker"])
                 if not s:
-                    rows.append({"우선순위": a["prio"], "종목": a["name"],
-                                 "기준일": "-", "현재가": "-", "200일선": "-", "괴리율": "-", "상태": "데이터 없음"})
+                    rows.append({"우선순위": a["prio"], "종목": a["name"], "기준일": "-",
+                                 "현재가": "-", "괴리율": "-", "RSI": "-", "상태": "데이터 없음"})
                     continue
                 if target and a["ticker"] == target["ticker"]:
                     stt = "🟢 보유 (현재 타겟)"
@@ -2167,7 +2176,8 @@ def render_rotation():
                 rows.append({
                     "우선순위": a["prio"], "종목": a["name"], "기준일": s["date"],
                     "현재가": f"{s['price']:,.2f}",
-                    "괴리율": f"{s['gap']:+.1f}%", "상태": stt,
+                    "괴리율": f"{s['gap']:+.1f}%",
+                    "RSI": _fmt_rsi(s.get("rsi")), "상태": stt,
                 })
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
             st.caption("종목별 기준일 표시 · BTC는 3% 완충 적용 (200일선 -3%까지 보유 유지)")
