@@ -1542,6 +1542,16 @@ _RECOVERY_DIST = [
 ]
 
 
+def _recovery_stats(ticker):
+    """티커의 200일선 복귀 통계 (평균, 중앙값, 최대) 반환. 없으면 None.
+    _RECOVERY_TOP50은 접미사 없는 미국 시총 TOP50 티커만 담고 있다."""
+    key = str(ticker).upper().replace(".KS", "").replace(".KQ", "")
+    for tk, _name, _cyc, avg, med, mx in _RECOVERY_TOP50:
+        if tk.upper() == key:
+            return {"avg": avg, "median": med, "max": mx}
+    return None
+
+
 def _recovery_action(avg_days):
     """평균 복귀일 기준 행동 가이드.
     중앙값은 모든 종목이 4~7일로 거의 같으므로, '모을 시간'을 결정하는 건
@@ -1767,6 +1777,9 @@ def render_winzone_catcher():
             vscore = val.get("score")
             vgrade = val.get("grade", "-")
             valuation = f"{vgrade} ({vscore})" if vscore is not None else "-"
+            # 200일선 복귀 통계 (미국 시총 TOP50만 내장, 달력일 기준)
+            rec = _recovery_stats(tk)
+            recovery = f"{rec['avg']}/{rec['median']}/{rec['max']}일" if rec else "-"
             hits.append({
                 "종목": v["name"],
                 "티커": tk,
@@ -1779,6 +1792,7 @@ def render_winzone_catcher():
                 "매칭 구간": f"{int(best_center):+d}%",
                 "역사적 승률": f"{wr:.0f}%",
                 "표본": f"{samples}건",
+                "복귀 평균/중앙/최대": recovery,
                 # 정렬/필터용 숨은 숫자값
                 "_wr": wr,
                 "_gap": gap,
@@ -1843,7 +1857,9 @@ def render_winzone_catcher():
     show_cols = [c for c in f.columns if not c.startswith("_")]
     st.dataframe(f[show_cols], use_container_width=True, hide_index=True)
 
-    st.caption("· '매칭 구간'은 현재 괴리율을 실제로 포함하는 사전계산 구간이에요. 포함 구간이 없으면 결과에서 제외합니다. "
+    st.caption("· '복귀 평균/중앙/최대'는 200일선 이탈 후 다시 위로 복귀까지 걸린 **달력일**이에요 "
+               "(미국 시총 TOP50만 내장, 그 외 종목·코인·환율은 '-'). "
+               "· '매칭 구간'은 현재 괴리율을 실제로 포함하는 사전계산 구간이에요. 포함 구간이 없으면 결과에서 제외합니다. "
                f"· 사전계산은 **폭 {meta.get('band', 10):.0f}% / 완충 {meta.get('step', 5):.0f}% 고정 그리드**이고 "
                "표본 15건 이상 구간만 저장해요. '위치별 승률 스크리너'에서 완충을 다르게 두면 같은 종목도 "
                "다른 구간이 잡혀 성공률이 달라 보일 수 있습니다(데이터가 다른 게 아니라 구간이 다른 것). "
