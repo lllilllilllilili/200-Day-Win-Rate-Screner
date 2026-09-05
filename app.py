@@ -570,6 +570,62 @@ def _rsi_wilder(close: pd.Series, period: int = 14):
     return float(last) if pd.notna(last) else None
 
 
+def _reversal_signal(close: pd.Series, gap: float):
+    """가격 데이터에서 관찰되는 '반전 조짐'을 종합 (예측 아님).
+
+    상방 반전 조짐(바닥권): 과매도 + RSI 저점 반등 + 200일선 한참 아래 + 하락 다이버전스
+    하방 반전 조짐(고점권): 과매수 + RSI 고점 꺾임 + 200일선 한참 위 + 상승 다이버전스
+    Returns (라벨, 상세리스트) — 조짐 없으면 ('관찰되는 반전 조짐 없음', 근거).
+    """
+    if close is None or len(close) < 30:
+        return "판단 불가 (데이터 부족)", []
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    ag = gain.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
+    al = loss.ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
+    rsi = (100 - 100 / (1 + ag / al)).dropna()
+    if len(rsi) < 15:
+        return "판단 불가 (데이터 부족)", []
+
+    cur_rsi = float(rsi.iloc[-1])
+    recent = rsi.tail(10)
+    rsi_min, rsi_max = float(recent.min()), float(recent.max())
+    px = close.dropna().tail(10)
+
+    up_pts, down_pts = [], []  # 상방 조짐 / 하방 조짐 근거
+    # 1) 과매도/과매수
+    if cur_rsi <= 30:
+        up_pts.append(f"RSI {cur_rsi:.0f} 과매도")
+    elif cur_rsi >= 70:
+        down_pts.append(f"RSI {cur_rsi:.0f} 과매수")
+    # 2) RSI가 최근 저점/고점에서 돌아섰는지
+    if cur_rsi <= 40 and cur_rsi >= rsi_min + 3:
+        up_pts.append("RSI 저점에서 반등 중")
+    if cur_rsi >= 60 and cur_rsi <= rsi_max - 3:
+        down_pts.append("RSI 고점에서 꺾임")
+    # 3) 다이버전스: 가격 신저점인데 RSI는 더 높음 / 가격 신고점인데 RSI는 더 낮음
+    if len(px) >= 6 and float(px.iloc[-1]) <= float(px.iloc[:-1].min()) and cur_rsi > rsi_min + 2:
+        up_pts.append("가격 신저점 + RSI 상승(강세 다이버전스)")
+    if len(px) >= 6 and float(px.iloc[-1]) >= float(px.iloc[:-1].max()) and cur_rsi < rsi_max - 2:
+        down_pts.append("가격 신고점 + RSI 하락(약세 다이버전스)")
+    # 4) 200일선에서 극단적으로 벌어짐 (평균회귀 압력)
+    if gap <= -20:
+        up_pts.append(f"200일선 {gap:+.0f}%로 과도한 하락")
+    elif gap >= 25:
+        down_pts.append(f"200일선 {gap:+.0f}%로 과도한 상승")
+
+    if len(up_pts) >= 2 and len(up_pts) > len(down_pts):
+        return "🟢 상방 반전 조짐 (바닥권 신호 우세)", up_pts
+    if len(down_pts) >= 2 and len(down_pts) > len(up_pts):
+        return "🔴 하방 반전 조짐 (고점권 신호 우세)", down_pts
+    if up_pts and len(up_pts) >= len(down_pts):
+        return "🟡 약한 상방 조짐 (근거 부족)", up_pts
+    if down_pts:
+        return "🟡 약한 하방 조짐 (근거 부족)", down_pts
+    return "⚪ 뚜렷한 반전 조짐 없음", []
+
+
 def _mvrv_zone(v):
     if v is None or not np.isfinite(v):
         return None
@@ -2554,6 +2610,14 @@ with tab1:
             gap_display = f"{cur_gap:+.1f}%"
             c4.metric("200일선 대비", gap_display, help=f"RSI(14): {_fmt_rsi(cur_rsi)}")
             st.caption(f"📉 RSI(14): **{_fmt_rsi(cur_rsi)}** (70↑ 과매수 · 30↓ 과매도)")
+
+            # --- 반전 조짐 (예측 아님, 현재 가격 데이터의 관찰) ---
+            rev_label, rev_reasons = _reversal_signal(raw["Close"], cur_gap)
+            rev_detail = (" · 근거: " + ", ".join(rev_reasons)) if rev_reasons else ""
+            st.caption(f"🔁 **반전 조짐**: {rev_label}{rev_detail}  \n"
+                       "<span style='color:gray'>※ 미래 예측이 아니라 지금 RSI·괴리율에서 나타나는 신호예요. "
+                       "조짐이 있어도 추세가 더 갈 수 있습니다.</span>",
+                       unsafe_allow_html=True)
 
             # --- 현재 추세 (50일선 vs 200일선) ---
             cur_sma50 = float(df["SMA50"].iloc[-1]) if "SMA50" in df.columns else None
