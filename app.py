@@ -73,6 +73,17 @@ try:
 except Exception:
     WINZONE_DATA, WINZONE_META = {}, {"target": 10, "stop": 5, "max_hold": 63, "band": 10, "step": 5}
 
+# 복귀 사이클·지수 민감도·재무건전성 사전계산 (precompute_recovery.py 로 생성)
+try:
+    import json as _rc_json, os as _rc_os
+    _rc_path = _rc_os.path.join(_rc_os.path.dirname(__file__), "recovery_data.json")
+    with open(_rc_path, encoding="utf-8") as _rc_f:
+        _rc = _rc_json.load(_rc_f)
+    RECOVERY_DATA = _rc["data"]
+    RECOVERY_META = _rc["meta"]
+except Exception:
+    RECOVERY_DATA, RECOVERY_META = {}, {}
+
 # ------------------------------------------------------------
 # 즐겨찾기 (URL 쿼리 파라미터에 저장 — 북마크/홈화면 추가로 유지)
 # ------------------------------------------------------------
@@ -1926,6 +1937,156 @@ def render_winzone_catcher():
                "· 표본이 적은 구간은 신뢰도가 낮을 수 있어요. 과거 성과가 미래를 보장하지 않습니다.")
 
 
+def render_pullback_finder():
+    st.subheader("🎯 복귀 빠른 눌림목 찾기")
+    st.caption("지금 **200일선 아래**에 있는 미장·국장 대형주 중, 과거에 200일선으로 "
+               "**빨리 복귀했던 종목**을 추려줍니다. 재무건전성과 지수 민감도(베타)로도 걸러요.")
+
+    if not RECOVERY_DATA:
+        st.error("사전계산 데이터(recovery_data.json)를 찾을 수 없어요. "
+                 "`python precompute_recovery.py` 를 먼저 실행해 주세요.")
+        return
+
+    gen = str(RECOVERY_META.get("generated_at", "미기록"))[:10]
+    st.info("📌 **복귀 기간**은 종가가 200일선 아래로 내려간 날부터 다시 위로 올라온 날까지의 "
+            "**달력일**이고, 아직 복귀하지 않은 구간은 통계에서 제외했어요.  \n"
+            f"📌 **베타**는 최근 {RECOVERY_META.get('beta_years', 3)}년 일간수익률 기준 "
+            "지수 민감도예요. **1보다 작으면 지수 등락에 덜 휩쓸린 종목**입니다 "
+            "(미장 S&P500 · 코스피 KOSPI · 코스닥 KOSDAQ 대비).")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        market_pick = st.selectbox("시장", ["전체", "미국", "국장"], index=0, key="pb_market")
+    with c2:
+        speed = st.selectbox("복귀 속도", ["전체", "빠름 (중앙값 5일 이하)",
+                                       "보통 (6~10일)", "느림 (11일 이상)"],
+                             index=1, key="pb_speed")
+    with c3:
+        depth = st.selectbox("현재 위치(괴리율)", ["200일선 아래 전체", "-5% 이하", "-10% 이하", "-20% 이하"],
+                             index=0, key="pb_depth")
+
+    c4, c5, c6 = st.columns(3)
+    with c4:
+        health_only = st.checkbox("재무건전성 좋은 종목만", value=True, key="pb_health",
+                                  help="ROE 15%↑ · 부채비율 100%↓ · 영업이익률 20%↑ 중 2개 이상 충족")
+    with c5:
+        low_beta = st.checkbox("지수 영향 적은 종목만 (베타 1.0↓)", value=False, key="pb_beta",
+                              help="지수가 빠질 때 상대적으로 덜 흔들렸던 종목만 봅니다.")
+    with c6:
+        min_cycles = st.number_input("최소 사이클 수", min_value=0, value=20, step=10,
+                                     key="pb_cycles",
+                                     help="복귀 통계를 신뢰할 만큼 과거 이탈→복귀가 충분했던 종목만")
+
+    if not st.button("🔍 눌림목 스캔", type="primary", key="pb_scan"):
+        st.info("버튼을 눌러 지금 200일선 아래에 있는 종목을 찾아보세요. "
+                f"(대상 {len(RECOVERY_DATA)}종목 현재가 확인, 20~40초 소요)")
+        return
+
+    mkmap = {"미국": "US", "국장": "KR"}
+    targets = [(tk, v) for tk, v in RECOVERY_DATA.items()
+               if market_pick == "전체" or v.get("market") == mkmap.get(market_pick)]
+    depth_max = {"200일선 아래 전체": 0.0, "-5% 이하": -5.0,
+                 "-10% 이하": -10.0, "-20% 이하": -20.0}[depth]
+
+    rows = []
+    prog = st.progress(0.0)
+    for i, (tk, v) in enumerate(targets):
+        prog.progress((i + 1) / max(1, len(targets)))
+        if int(v.get("cycles") or 0) < min_cycles:
+            continue
+        med = float(v.get("rec_med") or 0)
+        if speed.startswith("빠름") and med > 5:
+            continue
+        if speed.startswith("보통") and not (5 < med <= 10):
+            continue
+        if speed.startswith("느림") and med <= 10:
+            continue
+
+        health = v.get("health") or {}
+        if health_only and health.get("grade") != "🟢 건전":
+            continue
+        beta = v.get("beta")
+        if low_beta and (beta is None or beta > 1.0):
+            continue
+
+        r = _ds_status(tk)
+        if not r:
+            continue
+        gap = r["gap"]
+        if gap >= 0 or gap > depth_max:   # 200일선 위이거나 원하는 깊이보다 얕으면 제외
+            continue
+
+        # 현재 위치의 역사적 성공률 (사전계산 winzone, 구간을 포함할 때만)
+        wz = WINZONE_DATA.get(tk) or {}
+        zones = wz.get("zones") or {}
+        center = _match_zone_center(zones.keys(), gap, float(WINZONE_META.get("band", 10)))
+        if center is None:
+            wr_txt, wr_num, samp = "-", float("nan"), 0
+        else:
+            wr_num, samp = zones[center]
+            wr_txt = f"{wr_num:.0f}% ({samp}건)"
+
+        rows.append({
+            "종목": v["name"],
+            "티커": tk,
+            "시장": {"US": "🇺🇸", "KR": "🇰🇷"}.get(v.get("market"), ""),
+            "현재 괴리율": f"{gap:+.1f}%",
+            "RSI": _fmt_rsi(r.get("rsi")),
+            "현재위치 성공률": wr_txt,
+            "복귀 최단": f"{int(v['rec_min'])}일",
+            "복귀 중간": f"{med:.0f}일",
+            "복귀 최장": f"{int(v['rec_max'])}일",
+            "1주내 복귀": f"{v.get('within_1w', float('nan')):.0f}%",
+            "베타": "-" if beta is None else f"{beta:.2f}",
+            "재무": health.get("grade", "-"),
+            "사이클": f"{int(v['cycles'])}회",
+            "_med": med, "_gap": gap, "_wr": wr_num,
+            "_beta": beta if beta is not None else float("nan"),
+            "_w1": float(v.get("within_1w") or 0),
+        })
+    prog.empty()
+
+    if not rows:
+        st.warning("조건에 맞는 종목이 없어요. 복귀 속도나 재무·베타 필터를 완화해 보세요. "
+                   "지금 대형주 대부분이 200일선 위일 수도 있어요.")
+        return
+
+    df = pd.DataFrame(rows)
+    st.success(f"🎯 조건에 맞는 종목: **{len(df)}개** (200일선 아래 + 복귀 통계 보유)")
+
+    sort_by = st.selectbox("정렬 기준",
+                           ["복귀 중간값 빠른 순", "현재위치 성공률 높은 순",
+                            "괴리율 깊은 순", "1주내 복귀율 높은 순", "베타 낮은 순"],
+                           index=0, key="pb_sort")
+    sort_map = {"복귀 중간값 빠른 순": ("_med", True), "현재위치 성공률 높은 순": ("_wr", False),
+                "괴리율 깊은 순": ("_gap", True), "1주내 복귀율 높은 순": ("_w1", False),
+                "베타 낮은 순": ("_beta", True)}
+    col, asc = sort_map[sort_by]
+    df = df.sort_values(col, ascending=asc, na_position="last")
+
+    show = [c for c in df.columns if not c.startswith("_")]
+    st.dataframe(df[show], use_container_width=True, hide_index=True)
+
+    # --- 요약 해석 ---
+    fastest = df.iloc[0]
+    st.markdown(
+        f"**지금 가장 빨리 복귀했던 종목**: {fastest['시장']} **{fastest['종목']}** "
+        f"(괴리율 {fastest['현재 괴리율']}, 복귀 중간 {fastest['복귀 중간']}, "
+        f"최장 {fastest['복귀 최장']}, RSI {fastest['RSI']})  \n"
+        "<span style='color:gray'>· 복귀가 빠른 종목은 모을 시간이 짧으니 내려온 즉시 분할 매수, "
+        "복귀가 느린 종목은 여유 있게 나눠 담는 편이 유리해요. "
+        "· '복귀 최장'은 최악의 경우라 그 기간을 버틸 수 있는 비중으로 접근하세요.</span>",
+        unsafe_allow_html=True)
+
+    st.caption(
+        f"· 복귀 통계·베타·재무는 사전계산 내장값이에요 (생성일 {gen}). "
+        "· '현재위치 성공률'은 목표 +10% 선도달 또는 3개월 만기 양수 기준이며, "
+        "현재 괴리율을 실제로 포함하는 구간이 없으면 '-'로 표시합니다. "
+        "· 재무 지표는 yfinance 값이라 결측일 수 있고, 결측 종목은 '재무건전성 좋은 종목만' "
+        "필터에서 제외됩니다. "
+        "· 과거 통계이며 투자 권유가 아닙니다.")
+
+
 def render_sector_rotation():
     st.subheader("🗓️ 미국 섹터 순환매")
     st.caption("11개 미국 섹터 ETF의 월별 계절성 (1999~2026, 약 27년). 몇 월에 어떤 섹터가 강한지.")
@@ -2427,12 +2588,14 @@ with group1:
         render_crypto_screener()
 
 with group2:
-    sub = st.tabs(["📋 데일리 스캐너", "🎯 승률 포착기", "🌡️ 시장 붕괴 경고"])
+    sub = st.tabs(["📋 데일리 스캐너", "🎯 승률 포착기", "🎯 복귀 빠른 눌림목", "🌡️ 시장 붕괴 경고"])
     with sub[0]:
         render_daily_screener()
     with sub[1]:
         render_winzone_catcher()
     with sub[2]:
+        render_pullback_finder()
+    with sub[3]:
         render_crash_scanner()
 
 with group3:
