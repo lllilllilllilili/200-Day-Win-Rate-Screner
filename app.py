@@ -1937,6 +1937,49 @@ def render_winzone_catcher():
                "· 표본이 적은 구간은 신뢰도가 낮을 수 있어요. 과거 성과가 미래를 보장하지 않습니다.")
 
 
+def _pullback_score(wr, rec_med, within_1w, rec_max, beta, health_grade, rsi):
+    """'복귀 빠른 눌림목' 종합 점수(0~100)와 항목별 배점.
+
+    배점: 현재위치 성공률 35 · 복귀 속도 15 · 1주내 복귀율 10 · 재무건전성 15 ·
+          지수 민감도(저베타) 10 · 최악 체류 리스크 10 · RSI 과매도 5
+    값이 없는 항목은 유리하게도 불리하게도 처리하지 않도록 배점의 절반(중립)을 준다.
+    """
+    def clamp(v):
+        return max(0.0, min(1.0, v))
+
+    def ok(v):
+        return v is not None and v == v  # NaN 제외
+
+    parts = {}
+    # 이 위치에서 과거에 성공했는지 (가장 큰 비중)
+    parts["성공률"] = 35 * (clamp(wr / 100) if ok(wr) else 0.5)
+    # 복귀가 빠를수록 유리: 중앙값 1일 만점, 15일이면 0점
+    parts["복귀속도"] = 15 * (clamp((15 - rec_med) / 14) if ok(rec_med) else 0.5)
+    parts["1주내복귀"] = 10 * (clamp(within_1w / 100) if ok(within_1w) else 0.5)
+    parts["재무건전성"] = {"🟢 건전": 15.0, "🟡 보통": 8.0, "🔴 주의": 0.0}.get(health_grade, 7.5)
+    # 지수에 덜 휩쓸릴수록 유리: 베타 0.5 이하 만점, 1.5 이상 0점
+    parts["저베타"] = 10 * (clamp((1.5 - beta) / 1.0) if ok(beta) else 0.5)
+    # 최악의 경우 오래 묶이지 않을수록 유리: 180일 이하 만점, 730일 이상 0점
+    parts["최악리스크"] = 10 * (clamp((730 - rec_max) / 550) if ok(rec_max) else 0.5)
+    # 과매도일수록 반등 여지: RSI 30 이하 만점, 60 이상 0점
+    parts["과매도"] = 5 * (clamp((60 - rsi) / 30) if ok(rsi) else 0.5)
+
+    return round(sum(parts.values()), 1), parts
+
+
+def _score_grade(score, low_confidence=False):
+    """점수 → 등급 라벨. 표본이 얇으면 경고 표시를 덧붙인다."""
+    if score >= 80:
+        label = "🟢 A"
+    elif score >= 70:
+        label = "🟡 B"
+    elif score >= 60:
+        label = "🟠 C"
+    else:
+        label = "🔴 D"
+    return f"{label} ⚠️" if low_confidence else label
+
+
 def render_pullback_finder():
     st.subheader("🎯 복귀 빠른 눌림목 찾기")
     st.caption("지금 **200일선 아래**에 있는 미장·국장 대형주 중, 과거에 200일선으로 "
@@ -2026,7 +2069,15 @@ def render_pullback_finder():
             wr_num, samp = zones[center]
             wr_txt = f"{wr_num:.0f}% ({samp}건)"
 
+        # 종합 점수 (항목별 배점 합)
+        score, parts = _pullback_score(
+            wr=wr_num, rec_med=med, within_1w=v.get("within_1w"),
+            rec_max=v.get("rec_max"), beta=beta,
+            health_grade=health.get("grade"), rsi=r.get("rsi"))
+        thin = int(v.get("cycles") or 0) < 30 or int(samp or 0) < 15
         rows.append({
+            "점수": score,
+            "등급": _score_grade(score, thin),
             "종목": v["name"],
             "티커": tk,
             "시장": {"US": "🇺🇸", "KR": "🇰🇷"}.get(v.get("market"), ""),
@@ -2040,6 +2091,7 @@ def render_pullback_finder():
             "베타": "-" if beta is None else f"{beta:.2f}",
             "재무": health.get("grade", "-"),
             "사이클": f"{int(v['cycles'])}회",
+            "_score": score, "_parts": parts,
             "_med": med, "_gap": gap, "_wr": wr_num,
             "_beta": beta if beta is not None else float("nan"),
             "_w1": float(v.get("within_1w") or 0),
@@ -2055,10 +2107,11 @@ def render_pullback_finder():
     st.success(f"🎯 조건에 맞는 종목: **{len(df)}개** (200일선 아래 + 복귀 통계 보유)")
 
     sort_by = st.selectbox("정렬 기준",
-                           ["복귀 중간값 빠른 순", "현재위치 성공률 높은 순",
+                           ["종합 점수 높은 순", "복귀 중간값 빠른 순", "현재위치 성공률 높은 순",
                             "괴리율 깊은 순", "1주내 복귀율 높은 순", "베타 낮은 순"],
                            index=0, key="pb_sort")
-    sort_map = {"복귀 중간값 빠른 순": ("_med", True), "현재위치 성공률 높은 순": ("_wr", False),
+    sort_map = {"종합 점수 높은 순": ("_score", False),
+                "복귀 중간값 빠른 순": ("_med", True), "현재위치 성공률 높은 순": ("_wr", False),
                 "괴리율 깊은 순": ("_gap", True), "1주내 복귀율 높은 순": ("_w1", False),
                 "베타 낮은 순": ("_beta", True)}
     col, asc = sort_map[sort_by]
@@ -2067,16 +2120,35 @@ def render_pullback_finder():
     show = [c for c in df.columns if not c.startswith("_")]
     st.dataframe(df[show], use_container_width=True, hide_index=True)
 
-    # --- 요약 해석 ---
-    fastest = df.iloc[0]
+    # --- 요약 해석 (점수 1위 종목의 근거 분해) ---
+    top = df.sort_values("_score", ascending=False).iloc[0]
+    parts = top["_parts"]
+    breakdown = " · ".join(f"{k} {v:.1f}" for k, v in parts.items())
     st.markdown(
-        f"**지금 가장 빨리 복귀했던 종목**: {fastest['시장']} **{fastest['종목']}** "
-        f"(괴리율 {fastest['현재 괴리율']}, 복귀 중간 {fastest['복귀 중간']}, "
-        f"최장 {fastest['복귀 최장']}, RSI {fastest['RSI']})  \n"
-        "<span style='color:gray'>· 복귀가 빠른 종목은 모을 시간이 짧으니 내려온 즉시 분할 매수, "
-        "복귀가 느린 종목은 여유 있게 나눠 담는 편이 유리해요. "
-        "· '복귀 최장'은 최악의 경우라 그 기간을 버틸 수 있는 비중으로 접근하세요.</span>",
+        f"**종합 점수 1위**: {top['시장']} **{top['종목']}** — {top['점수']}점 ({top['등급']})  \n"
+        f"괴리율 {top['현재 괴리율']} · RSI {top['RSI']} · 현재위치 성공률 {top['현재위치 성공률']} · "
+        f"복귀 중간 {top['복귀 중간']} / 최장 {top['복귀 최장']} · 베타 {top['베타']} · 재무 {top['재무']}  \n"
+        f"<span style='color:gray'>점수 구성: {breakdown}</span>",
         unsafe_allow_html=True)
+
+    with st.expander("🧮 점수는 어떻게 계산되나 (총 100점)", expanded=False):
+        st.markdown("""
+| 항목 | 배점 | 만점 조건 | 0점 조건 |
+|---|---|---|---|
+| 현재위치 성공률 | 35 | 100% | 0% |
+| 복귀 속도(중앙값) | 15 | 1일 | 15일 이상 |
+| 1주내 복귀율 | 10 | 100% | 0% |
+| 재무건전성 | 15 | 🟢 건전 | 🔴 주의 |
+| 지수 민감도(베타) | 10 | 0.5 이하 | 1.5 이상 |
+| 최악 체류 리스크 | 10 | 180일 이하 | 730일 이상 |
+| RSI 과매도 | 5 | 30 이하 | 60 이상 |
+
+**등급**: 80↑ 🟢A · 70↑ 🟡B · 60↑ 🟠C · 그 아래 🔴D
+
+- 값이 없는 항목(성공률·베타·재무 미상 등)은 유리하게도 불리하게도 쓰지 않고 **배점의 절반**을 줍니다.
+- 등급에 **⚠️** 가 붙으면 표본이 얇다는 뜻이에요 (복귀 사이클 30회 미만 또는 성공률 표본 15건 미만).
+- 점수는 과거 통계를 한 줄로 요약한 참고값이며, 미래 수익을 보장하지 않습니다.
+        """)
 
     st.caption(
         f"· 복귀 통계·베타·재무는 사전계산 내장값이에요 (생성일 {gen}). "
