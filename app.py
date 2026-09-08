@@ -3023,10 +3023,205 @@ def _accum_levels(gap, ma200, levels_pct, weights, zones, zones_sma, band):
     return rows
 
 
+def _accum_rank(cands):
+    """후보군 내 상대 순위(백분위)와 절대 조건을 섞어 100점 만점 점수를 만든다.
+
+    백테스트 지표는 청산 규칙에 따라 절대 스케일이 완전히 달라진다.
+    '200일선 복귀'는 승률이 구조적으로 90%대고 '평균단가 +10%'는 거의 100%다.
+    절대 임계값으로 점수를 매기면 규칙을 바꿀 때마다 기준이 무의미해지므로,
+    같은 조건으로 스캔한 후보군 내 백분위로 환산한다.
+
+    배점: 기대수익 25 · 하방방어 20 · 승률 15 · 현재위치 15 ·
+          미실현손실 10 · 표본신뢰 10 · 재무건전성 5
+    """
+    if not cands:
+        return []
+
+    def pctile(vals, higher_better=True):
+        a = np.asarray(vals, float)
+        if higher_better:
+            return np.array([float((a <= x).mean()) for x in a])
+        return np.array([float((a >= x).mean()) for x in a])
+
+    def gap_score(g):
+        # 얕으면 살 이유가 약하고, 너무 깊으면 펀더멘털 훼손 쪽이 의심된다.
+        if g >= 0:
+            return 0.0
+        if g > -10:
+            return 0.5
+        if g >= -30:
+            return 1.0
+        if g >= -40:
+            return 0.7
+        return 0.4
+
+    p_ret = pctile([c["_ret"] for c in cands])
+    p_p25 = pctile([c["_p25"] for c in cands])
+    p_win = pctile([c["_win"] for c in cands])
+    p_dd = pctile([c["_dd"] for c in cands])          # 0에 가까울수록 유리
+    hmap = {"🟢 건전": 1.0, "🟡 보통": 0.5, "🔴 주의": 0.0}
+
+    for i, c in enumerate(cands):
+        parts = {
+            "기대수익": 25 * p_ret[i],
+            "하방방어": 20 * p_p25[i],
+            "승률": 15 * p_win[i],
+            "현재위치": 15 * gap_score(c["_gap"]),
+            "미실현손실": 10 * p_dd[i],
+            "표본신뢰": 10 * min(1.0, c["_n"] / 30),
+            "재무건전성": 5 * hmap.get(c["_health"], 0.5),
+        }
+        c["_score"] = round(sum(parts.values()), 1)
+        c["_parts"] = parts
+    cands.sort(key=lambda c: -c["_score"])
+    return cands
+
+
+def _render_accum_scan():
+    """200일선 아래 종목을 종합점수로 순위 매겨 적립 후보를 뽑는다.
+
+    백테스트 통계는 사전계산(accum_data.json)을 쓰고 현재가만 조회한다.
+    219종목을 실시간 백테스트하면 2분이 걸리지만, 사전계산을 쓰면
+    현재가 확인만으로 끝나 다른 스캐너와 같은 20~40초 수준이 된다.
+    """
+    with st.expander("🏆 적립 후보 TOP 찾기 — 종합점수 순위", expanded=False):
+        if not ACCUM_DATA:
+            st.warning("사전계산 데이터(accum_data.json)가 없어요. "
+                       "`python precompute_accum.py` 를 실행하면 이 기능을 쓸 수 있습니다.")
+            return
+
+        rl = {"sma": "200일선 복귀 시 매도", "target": "평균단가 +10% 도달 시 매도",
+              "hold1": "1개월 보유", "hold3": "3개월 보유",
+              "hold6": "6개월 보유", "hold12": "12개월 보유"}
+        sl = {"equal": "균등", "pyramid": "하방증량"}
+
+        c1, c2, c3, c4 = st.columns(4)
+        rule = c1.selectbox("청산 규칙", list(rl), format_func=lambda k: rl[k],
+                            index=3, key="as_rule",
+                            help="보유 기간 규칙이 종목 간 변별력이 가장 큽니다.")
+        scheme = c2.selectbox("비중", list(sl), format_func=lambda k: sl[k],
+                              index=0, key="as_scheme")
+        pos = c3.selectbox("현재 위치",
+                           ["첫 구간(-5%) 도달만", "200일선 아래만", "전체"],
+                           index=0, key="as_pos",
+                           help="'200일선 아래만'은 -0.3% 처럼 첫 매수 구간에 아직 닿지 않은 "
+                                "종목까지 포함합니다. 지금 살 수 있는 종목만 보려면 첫 구간 도달을 "
+                                "고르세요.")
+        topn = int(c4.number_input("표시 개수", 5, 50, 10, 5, key="as_topn"))
+
+        c5, c6 = st.columns(2)
+        min_eps = int(c5.number_input("최소 에피소드", 0, 100, 10, 5, key="as_eps",
+                                     help="백테스트 표본이 이보다 적은 종목은 제외합니다."))
+        health_only = c6.checkbox("재무건전성 좋은 종목만 (🟢 건전)", value=False, key="as_health")
+
+        if st.button("🔍 후보 스캔", type="primary", key="as_go"):
+            key = f"{rule}|{scheme}"
+            # 사다리에서 가장 얕은(먼저 닿는) 구간. levels 가 음수라 max 가 -5% 다.
+            first_lv = max(ACCUM_META.get("levels") or [-5.0])
+            targets = [(tk, v) for tk, v in ACCUM_DATA.items() if key in (v.get("combos") or {})]
+            rows, prog = [], st.progress(0.0)
+            for i, (tk, v) in enumerate(targets):
+                prog.progress((i + 1) / max(1, len(targets)))
+                bt = v["combos"][key]
+                if int(bt.get("n") or 0) < min_eps:
+                    continue
+                health = ((RECOVERY_DATA.get(tk) or {}).get("health") or {}).get("grade", "-")
+                if health_only and health != "🟢 건전":
+                    continue
+                r = _ds_status(tk)
+                if not r:
+                    continue
+                gap = r["gap"]
+                if pos.startswith("첫") and gap > first_lv:
+                    continue
+                if pos.startswith("200") and gap >= 0:
+                    continue
+                rows.append({
+                    "종목": v.get("name", tk), "티커": tk,
+                    "시장": {"US": "🇺🇸", "KR": "🇰🇷", "ALT": "🪙",
+                            "FXB": "💱", "IDX": "📊"}.get(v.get("market"), ""),
+                    "현재 괴리율": f"{gap:+.1f}%",
+                    "진입": "지금 매수" if gap <= first_lv else f"대기 ({first_lv:+.0f}% 미도달)",
+                    "RSI": _fmt_rsi(r.get("rsi")),
+                    "승률": f"{bt['win']:.0f}%", "수익 중앙": f"{bt['ret_med']:+.1f}%",
+                    "수익 p25": f"{bt['ret_p25']:+.1f}%", "미실현 DD": f"{bt['dd_med']:+.1f}%",
+                    "투입률": f"{bt['inv_med']:.0f}%", "보유일": bt["hold_med"],
+                    "에피소드": f"{bt['n']}회" + (" ⚠️" if bt.get("thin") else ""),
+                    "재무": health,
+                    "_ret": bt["ret_med"], "_p25": bt["ret_p25"], "_win": bt["win"],
+                    "_dd": bt["dd_med"], "_gap": gap, "_n": bt["n"], "_health": health,
+                })
+            prog.empty()
+            st.session_state["as_rows"] = _accum_rank(rows)
+            st.session_state["as_desc"] = f"{rl[rule]} · {sl[scheme]} · {pos}"
+
+        rows = st.session_state.get("as_rows")
+        if rows is None:
+            st.caption(f"· 대상 {len(ACCUM_DATA)}종목. 백테스트는 사전계산을 쓰고 현재가만 "
+                       "조회하므로 20~40초 걸립니다.")
+            return
+        if not rows:
+            st.warning("조건에 맞는 종목이 없어요. 최소 에피소드나 재무 필터를 완화해 보세요.")
+            return
+
+        st.success(f"🏆 **{len(rows)}종목** 중 상위 {min(topn, len(rows))}개 "
+                   f"({st.session_state.get('as_desc', '')})")
+        show = [c for c in rows[0] if not c.startswith("_")]
+        table = pd.DataFrame([
+            {"순위": i + 1, "점수": r["_score"], "등급": _score_grade(r["_score"], r["_n"] < 20),
+             **{k: r[k] for k in show}}
+            for i, r in enumerate(rows[:topn])])
+        st.dataframe(table, use_container_width=True, hide_index=True)
+
+        top = rows[0]
+        bd = " · ".join(f"{k} {v:.1f}" for k, v in top["_parts"].items())
+        st.markdown(f"**1위**: {top['시장']} **{top['종목']}** (`{top['티커']}`) — "
+                    f"{top['_score']}점  \n"
+                    f"괴리율 {top['현재 괴리율']} · 승률 {top['승률']} · "
+                    f"수익 중앙 {top['수익 중앙']} · 하위25% {top['수익 p25']} · "
+                    f"미실현 DD {top['미실현 DD']}  \n"
+                    f"<span style='color:gray'>점수 구성: {bd}</span>",
+                    unsafe_allow_html=True)
+
+        p1, p2 = st.columns([2, 1])
+        pick = p1.selectbox("이 중에서 상세 계획 보기",
+                            [f"{r['종목']} ({r['티커']})" for r in rows[:topn]], key="as_pick")
+        if p2.button("📐 이 종목으로 계획 만들기", key="as_apply"):
+            st.session_state["ap_q"] = pick[pick.rfind("(") + 1:-1]
+            st.rerun()
+
+        with st.expander("🧮 점수는 어떻게 계산되나 (총 100점)", expanded=False):
+            st.markdown("""
+| 항목 | 배점 | 기준 |
+|---|---|---|
+| 기대수익 | 25 | 백테스트 수익률 중앙값의 **후보군 내 백분위** |
+| 하방방어 | 20 | 수익률 하위 25%(p25)의 백분위 — 최악 케이스가 얼마나 버티는지 |
+| 승률 | 15 | 승률의 백분위 |
+| 현재위치 | 15 | 200일선 대비 −10~−30%면 만점, −10%보다 얕거나 −30%보다 깊으면 감점 |
+| 미실현손실 | 10 | 버텨야 할 미실현 손실이 얕은 쪽이 유리 |
+| 표본신뢰 | 10 | 에피소드 30회면 만점 |
+| 재무건전성 | 5 | 🟢 건전 만점 · 🟡 보통 절반 · 🔴 주의 0 |
+
+- **백분위를 쓰는 이유**: 청산 규칙에 따라 승률·수익률의 절대 스케일이 달라집니다.
+  '200일선 복귀'는 승률이 구조적으로 90%대, '평균단가 +10%'는 거의 100%예요.
+  절대 임계값으로는 규칙을 바꿀 때마다 기준이 무의미해지므로 같은 조건으로 스캔한
+  후보군 안에서 상대 순위를 봅니다. **점수는 후보군 내 상대 평가입니다.**
+- **현재위치만 절대 기준**입니다. −10%보다 얕으면 살 이유가 약하고, −30%보다 깊으면
+  통계가 설명하지 못하는 펀더멘털 훼손 가능성이 커집니다.
+- 등급에 ⚠️ 가 붙으면 에피소드 20회 미만으로 표본이 얇다는 뜻입니다.
+- 과거 통계이며 투자 권유가 아닙니다.
+            """)
+
+
 def render_accum_plan():
     st.subheader("📐 적립 계획 만들기")
     st.caption("**적립 전용 백테스트**로 이 전략의 실제 수익률을 확인하고, "
                "20·50·200일선 위치에 맞춰 어느 가격부터 얼마씩 모아갈지 계획을 만듭니다.")
+
+    # 종목을 정하지 못했을 때 후보부터 찾을 수 있게 위에 둔다.
+    # 아래 종목 입력 위젯보다 먼저 렌더해야 '이 종목으로 계획 만들기'가
+    # session_state 를 채운 뒤 rerun 으로 반영된다.
+    _render_accum_scan()
 
     rule_label = {
         "sma": "200일선 복귀 시 매도",
@@ -3040,7 +3235,10 @@ def render_accum_plan():
 
     c1, c2 = st.columns([2, 1])
     with c1:
-        query = st.text_input("종목 티커 / 종목코드 / 기업명", value="AAPL",
+        # 기본값을 value= 로 주면 스캔 결과에서 session_state 로 채울 때 경고가 난다.
+        # session_state 를 단일 소스로 두는 게 Streamlit 권장 패턴이다.
+        st.session_state.setdefault("ap_q", "AAPL")
+        query = st.text_input("종목 티커 / 종목코드 / 기업명",
                               placeholder="예: AAPL, TQQQ, BTC-USD, 005930, 삼성전자",
                               key="ap_q")
     with c2:
