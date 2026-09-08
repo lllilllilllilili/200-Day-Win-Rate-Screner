@@ -3186,7 +3186,8 @@ def render_accum_plan():
 
     table = pd.DataFrame([{
         "구간": f"{r['level']:+.0f}%",
-        "매수 가격": f"{r['buy']:,.2f}" + (" (지금)" if r["reached"] else ""),
+        "상태": "지금 매수" if r["reached"] else "대기",
+        "매수 가격": f"{r['buy']:,.2f}",
         "현재가 대비": f"{(r['buy'] / px - 1) * 100:+.1f}%",
         "비중": f"{r['weight']:.0f}%",
         "배분액": f"{budget * r['weight'] / 100:,.1f}" if budget else "-",
@@ -3198,6 +3199,21 @@ def render_accum_plan():
         "겹치는 선": line_tag(r),
     } for r in rows])
     st.markdown("#### 🪜 적립 사다리 · 자금 소진 시뮬레이션")
+
+    passed = [r for r in rows if r["reached"]]
+    if passed:
+        imm = sum(r["weight"] for r in passed)
+        st.info(
+            f"현재가가 이미 **{passed[-1]['level']:+.0f}% 구간 아래**({gap:+.1f}%)입니다. "
+            f"위쪽 {len(passed)}개 구간({passed[0]['level']:+.0f}% ~ {passed[-1]['level']:+.0f}%)의 "
+            f"원래 가격은 {passed[0]['price']:,.2f} ~ {passed[-1]['price']:,.2f} 인데 모두 현재가보다 "
+            f"비싸서, 지금보다 높은 가격을 제시하지 않도록 **현재가로 대체**했습니다. "
+            f"그래서 같은 가격이 {len(passed)}줄로 보입니다.  \n"
+            f"지금 시작하면 그 구간들을 한 번에 채우게 되어 **예산의 {imm:.0f}%를 즉시 투입**하고, "
+            f"남은 {100 - imm:.0f}%가 아래 구간에서 대기합니다.  \n"
+            f"백테스트는 200일선 -5% 이탈 시점부터 순차 매수한 결과입니다. 지금처럼 늦게 "
+            f"시작하면 평균단가는 더 낮아지지만, 아래로 남은 대기 구간이 그만큼 줄어듭니다.")
+
     st.dataframe(table, use_container_width=True, hide_index=True)
     st.caption(
         "· **여기서 멈추면 평단**은 그 구간까지만 채우고 반등했을 때의 평균단가입니다. "
@@ -3209,10 +3225,19 @@ def render_accum_plan():
     # --- 결론 ---
     st.markdown("#### ✅ 결론")
     first = rows[0]
-    start_txt = ("지금 바로 — 이미 첫 구간 아래입니다"
-                 if first["reached"]
-                 else f"{first['buy']:,.2f} (현재가 대비 {(first['buy'] / px - 1) * 100:+.1f}%)")
-    lines = [f"**시작 가격**: {start_txt} — 200일선 {first['level']:+.0f}% 구간"]
+    if first["reached"]:
+        imm = sum(r["weight"] for r in rows if r["reached"])
+        wait = [r for r in rows if not r["reached"]]
+        nxt = (f" 다음 매수는 {wait[0]['buy']:,.2f}"
+               f"(200일선 {wait[0]['level']:+.0f}%, 현재가 대비 "
+               f"{(wait[0]['buy'] / px - 1) * 100:+.1f}%)부터입니다." if wait else
+               " 이미 마지막 구간까지 내려와 예산 전액이 지금 들어갑니다.")
+        lines = [f"**시작 가격**: 지금 바로 {px:,.2f} — 예산의 **{imm:.0f}%를 즉시 투입**."
+                 + nxt]
+    else:
+        lines = [f"**시작 가격**: {first['buy']:,.2f} "
+                 f"(현재가 대비 {(first['buy'] / px - 1) * 100:+.1f}%) "
+                 f"— 200일선 {first['level']:+.0f}% 구간"]
 
     stop_row = None
     if bt:
