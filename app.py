@@ -2171,8 +2171,10 @@ def render_pullback_finder():
             "현재위치 성공률": wr_txt,
             "복귀 최단": f"{int(v['rec_min'])}일",
             "복귀 중간": f"{med:.0f}일",
+            "평균 복귀": "-" if v.get("rec_avg") is None else f"{float(v['rec_avg']):.0f}일",
             "복귀 최장": f"{int(v['rec_max'])}일",
             "1주내 복귀": f"{v.get('within_1w', float('nan')):.0f}%",
+            "2주초과": "-" if v.get("over_2w") is None else f"{float(v['over_2w']):.0f}%",
             "베타": "-" if beta is None else f"{beta:.2f}",
             "재무": health.get("grade", "-"),
             "사이클": f"{int(v['cycles'])}회",
@@ -2180,6 +2182,8 @@ def render_pullback_finder():
             "_med": med, "_gap": gap, "_wr": wr_num,
             "_beta": beta if beta is not None else float("nan"),
             "_w1": float(v.get("within_1w") or 0),
+            "_avg": float(v["rec_avg"]) if v.get("rec_avg") is not None else float("nan"),
+            "_o2w": float(v["over_2w"]) if v.get("over_2w") is not None else float("nan"),
         })
     prog.empty()
 
@@ -2192,11 +2196,16 @@ def render_pullback_finder():
     st.success(f"🎯 조건에 맞는 종목: **{len(df)}개** (200일선 아래 + 복귀 통계 보유)")
 
     sort_by = st.selectbox("정렬 기준",
-                           ["종합 점수 높은 순", "복귀 중간값 빠른 순", "현재위치 성공률 높은 순",
+                           ["종합 점수 높은 순", "복귀 중간값 빠른 순", "평균 복귀 빠른 순",
+                            "2주초과율 낮은 순 (빨리 복귀)", "2주초과율 높은 순 (모을 시간 많음)",
+                            "현재위치 성공률 높은 순",
                             "괴리율 깊은 순", "1주내 복귀율 높은 순", "베타 낮은 순"],
                            index=0, key="pb_sort")
     sort_map = {"종합 점수 높은 순": ("_score", False),
                 "복귀 중간값 빠른 순": ("_med", True), "현재위치 성공률 높은 순": ("_wr", False),
+                "평균 복귀 빠른 순": ("_avg", True),
+                "2주초과율 낮은 순 (빨리 복귀)": ("_o2w", True),
+                "2주초과율 높은 순 (모을 시간 많음)": ("_o2w", False),
                 "괴리율 깊은 순": ("_gap", True), "1주내 복귀율 높은 순": ("_w1", False),
                 "베타 낮은 순": ("_beta", True)}
     col, asc = sort_map[sort_by]
@@ -2212,7 +2221,8 @@ def render_pullback_finder():
     st.markdown(
         f"**종합 점수 1위**: {top['시장']} **{top['종목']}** — {top['점수']}점 ({top['등급']})  \n"
         f"괴리율 {top['현재 괴리율']} · RSI {top['RSI']} · 현재위치 성공률 {top['현재위치 성공률']} · "
-        f"복귀 중간 {top['복귀 중간']} / 최장 {top['복귀 최장']} · 베타 {top['베타']} · 재무 {top['재무']}  \n"
+        f"복귀 중간 {top['복귀 중간']} / 평균 {top['평균 복귀']} / 최장 {top['복귀 최장']} · "
+        f"2주초과 {top['2주초과']} · 베타 {top['베타']} · 재무 {top['재무']}  \n"
         f"<span style='color:gray'>점수 구성: {breakdown}</span>",
         unsafe_allow_html=True)
 
@@ -2237,6 +2247,12 @@ def render_pullback_finder():
 
     st.caption(
         f"· 복귀 통계·베타·재무는 사전계산 내장값이에요 (생성일 {gen}). "
+        "· **'복귀 중간'은 전형값**이고 대형주 대부분이 4~7일에 몰려 있어 종목 간 차이가 거의 없어요. "
+        "**'평균 복귀'는 깊게 빠졌을 때의 체류 기간**을 반영하지만 최장 사례 한두 건에 끌려갑니다 "
+        "(최장값과 상관 0.36). "
+        "**'2주초과'는 이탈 시 2주를 넘긴 비율**로, 최장값에 거의 흔들리지 않아 "
+        "'분할매수 시간을 확보할 확률'에 가장 가까운 지표예요 (최장값과 상관 0.01). "
+        "· 점수의 '복귀 속도' 항목은 아직 **중앙값 기준**이라, 표의 평균·2주초과와 순위가 다를 수 있어요. "
         "· '현재위치 성공률'은 목표 +10% 선도달 또는 3개월 만기 양수 기준이며, "
         "현재 괴리율을 실제로 포함하는 구간이 없으면 '-'로 표시합니다. "
         "· 재무 지표는 yfinance 값이라 결측일 수 있고, 결측 종목은 '재무건전성 좋은 종목만' "
