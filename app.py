@@ -152,19 +152,101 @@ def is_favorite(ticker: str) -> bool:
 # ------------------------------------------------------------
 # 데이터 로딩
 # ------------------------------------------------------------
+def _bundled_kr_listing() -> pd.DataFrame:
+    """FDR 목록 조회가 막혔을 때 쓰는 내장 대형주 목록.
+
+    사전계산 데이터(winzone/recovery)와 국장 스캐너 상수에 들어 있는
+    국내 종목명을 모아 최소한의 검색이 가능하게 한다.
+    """
+    rows = {}
+    for source in (WINZONE_DATA, RECOVERY_DATA):
+        for tk, v in (source or {}).items():
+            if not isinstance(v, dict) or v.get("market") != "KR":
+                continue
+            code = str(tk).replace(".KS", "").replace(".KQ", "")
+            rows[code] = {
+                "Code": code,
+                "Name": str(v.get("name") or code),
+                "Market": "KOSDAQ" if str(tk).endswith(".KQ") else "KOSPI",
+            }
+    for tk, name, *_ in _KR_WINZONE:
+        code = str(tk).replace(".KS", "").replace(".KQ", "")
+        rows.setdefault(code, {
+            "Code": code, "Name": name,
+            "Market": "KOSDAQ" if str(tk).endswith(".KQ") else "KOSPI",
+        })
+    df = pd.DataFrame(list(rows.values()), columns=["Code", "Name", "Market"])
+    df["Fallback"] = True
+    return df
+
+
 @st.cache_data(ttl=86400, show_spinner=False, max_entries=1)
 def load_krx_listing() -> pd.DataFrame:
-    """한국 상장 종목 전체 목록(코드+이름). 실패 시 빈 DF."""
+    """한국 상장 종목 목록(코드+이름+시장).
+
+    FinanceDataReader 목록 API가 간헐적으로 404를 내므로 여러 소스를 차례로
+    시도하고, 전부 실패하면 앱에 내장된 대형주 목록으로 대체한다.
+    반환 DF의 'Fallback' 열이 True면 내장 목록(대형주만)이라는 뜻이다.
+    """
     try:
         import FinanceDataReader as fdr
-        df = fdr.StockListing("KRX")
-        return df[["Code", "Name", "Market"]].copy()
     except Exception:
-        return pd.DataFrame(columns=["Code", "Name", "Market"])
+        return _bundled_kr_listing()
+
+    # 1) 전체 목록 한 번에
+    try:
+        df = fdr.StockListing("KRX")
+        if df is not None and len(df) and {"Code", "Name", "Market"} <= set(df.columns):
+            out = df[["Code", "Name", "Market"]].copy()
+            out["Fallback"] = False
+            return out
+    except Exception:
+        pass
+
+    # 2) 시장별로 나눠서 재시도 (KRX 엔드포인트만 막히는 경우가 있음)
+    frames = []
+    for market in ("KOSPI", "KOSDAQ"):
+        try:
+            part = fdr.StockListing(market)
+        except Exception:
+            continue
+        if part is None or len(part) == 0 or "Code" not in part.columns:
+            continue
+        part = part.copy()
+        if "Market" not in part.columns:
+            part["Market"] = market
+        frames.append(part[["Code", "Name", "Market"]])
+    if frames:
+        out = pd.concat(frames).drop_duplicates(subset="Code").reset_index(drop=True)
+        out["Fallback"] = False
+        return out
+
+    # 3) 전부 실패 → 내장 대형주 목록
+    return _bundled_kr_listing()
 
 
 def _has_korean(text: str) -> bool:
     return any("\uac00" <= ch <= "\ud7a3" for ch in text)
+
+
+@st.cache_data(ttl=86400, show_spinner=False, max_entries=50)
+def _kr_suffix_by_data(code: str) -> str:
+    """상장 목록으로 시장을 모를 때, 실제 가격 데이터가 있는 접미사를 골라준다.
+
+    코스닥 종목을 '.KS'로 조회하면 yfinance가 다른 상품(펀드 등)에 매칭돼
+    데이터가 몇 줄만 오거나 재무가 비므로, 두 접미사를 받아 더 긴 쪽을 쓴다.
+    """
+    best, best_len = ".KS", -1
+    for suffix in (".KS", ".KQ"):
+        try:
+            raw = yf.download(f"{code}{suffix}", period="1y",
+                              auto_adjust=True, progress=False)
+        except Exception:
+            continue
+        n = 0 if raw is None else len(raw.dropna(how="all"))
+        if n > best_len:
+            best, best_len = suffix, n
+    return best if best_len > 0 else ".KS"
 
 
 def _kr_ticker(code: str, market: str = None) -> str:
@@ -182,7 +264,10 @@ def _kr_ticker(code: str, market: str = None) -> str:
             hit = listing[listing["Code"].astype(str) == code]
             if len(hit):
                 mk = str(hit.iloc[0]["Market"])
-    return f"{code}.KQ" if (mk and "KOSDAQ" in mk.upper()) else f"{code}.KS"
+    if mk:
+        return f"{code}.KQ" if "KOSDAQ" in mk.upper() else f"{code}.KS"
+    # 목록에서 시장을 못 찾으면 실제 데이터로 판별한다.
+    return f"{code}{_kr_suffix_by_data(code)}"
 
 
 def _normalize_kr_code(text: str) -> str:
@@ -2791,9 +2876,19 @@ with tab1:
                 proceed = False  # 아직 선택 대기
         else:  # kind == "none"
             if _has_korean(ticker):
-                # 한글로 검색했는데 못 찾음 -> 한국종목 의도가 명확하니 에러
-                st.error(f"'{ticker}' 에 해당하는 한국 종목을 찾지 못했어요. "
-                         f"정식 상장명이나 종목코드(예: 005930)로 시도해 보세요.")
+                # 한글로 검색했는데 못 찾음. 목록 조회 실패와 이름 오류를 구분해 안내한다.
+                _listing = load_krx_listing()
+                _is_fallback = bool(len(_listing)) and bool(_listing.get("Fallback", pd.Series([False])).iloc[0])
+                if _listing.empty or _is_fallback:
+                    st.error(
+                        f"⚠️ 한국 종목 목록을 지금 불러올 수 없어요(데이터 제공처 일시 오류). "
+                        f"그래서 **앱에 내장된 대형주 {len(_listing)}종목 안에서만** 검색됐고 "
+                        f"'{ticker}' 는 거기에 없었어요.  \n"
+                        f"→ **종목코드로 조회**하면 정상 동작해요 (예: `005830`, `005930`). "
+                        f"코드는 네이버·다음 금융에서 확인할 수 있어요.")
+                else:
+                    st.error(f"'{ticker}' 에 해당하는 한국 종목을 찾지 못했어요. "
+                             f"정식 상장명이나 종목코드(예: 005930)로 시도해 보세요.")
                 proceed = False
             # 영문인데 못 찾음 -> 해외 티커일 수 있으니 원본 그대로 yfinance 시도
             # (resolved_ticker 는 원본 유지, proceed 도 run 값 그대로)
