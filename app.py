@@ -84,6 +84,18 @@ try:
 except Exception:
     RECOVERY_DATA, RECOVERY_META = {}, {}
 
+# 적립(분할매수) 전용 백테스트 사전계산 (precompute_accum.py 로 생성)
+# 기존 두 JSON 과 완전히 분리된 파일이라, 없어도 앱의 다른 기능은 그대로 동작한다.
+try:
+    import json as _ac_json, os as _ac_os
+    _ac_path = _ac_os.path.join(_ac_os.path.dirname(__file__), "accum_data.json")
+    with open(_ac_path, encoding="utf-8") as _ac_f:
+        _ac = _ac_json.load(_ac_f)
+    ACCUM_DATA = _ac["data"]
+    ACCUM_META = _ac["meta"]
+except Exception:
+    ACCUM_DATA, ACCUM_META = {}, {}
+
 # ------------------------------------------------------------
 # 즐겨찾기 (URL 쿼리 파라미터에 저장 — 북마크/홈화면 추가로 유지)
 # ------------------------------------------------------------
@@ -2737,6 +2749,367 @@ def _babytqqq_rules():
 # ------------------------------------------------------------
 st.title("📈 200일선 투자 도구 모음")
 
+# ============================================================
+# 추가 도구 7: 적립 계획 만들기 (위치별 승률 × 20/50/200일선)
+# ============================================================
+@st.cache_data(ttl=1800, show_spinner=False, max_entries=60)
+def _accum_snapshot(ticker):
+    """현재가와 20/50/200일선, 괴리율, RSI를 한 번에 계산."""
+    df = _safe_dl(ticker, "2y")
+    if df is None or len(df) < 201:
+        return None
+    close = df["Close"]
+    rsi = _rsi_wilder(close)
+
+    def last_ma(window):
+        if len(close) < window:
+            return None
+        v = float(close.rolling(window).mean().iloc[-1])
+        return v if v == v else None
+
+    px = float(close.iloc[-1])
+    ma200 = last_ma(200)
+    if not ma200:
+        return None
+    return {"price": px, "ma20": last_ma(20), "ma50": last_ma(50), "ma200": ma200,
+            "gap": (px / ma200 - 1) * 100, "rsi": rsi,
+            "asof": str(close.index[-1])[:10]}
+
+
+def _zone_wr(zones, level, band):
+    """해당 괴리율 구간의 저장된 승률 (없으면 None)."""
+    if not zones:
+        return None
+    v = zones.get(str(int(level))) or zones.get(f"{level:g}")
+    if v is None:
+        c = _match_zone_center(zones.keys(), float(level), float(band))
+        v = zones.get(c) if c is not None else None
+    if not v:
+        return None
+    try:
+        return float(v[0]), int(v[1])
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def _accum_levels(gap, ma200, levels_pct, weights, zones, zones_sma, band):
+    """백테스트와 동일한 사다리·비중으로 매수 계획을 만든다.
+
+    비중을 기대값 가중이 아니라 백테스트가 검증한 equal/pyramid 로 맞춘 이유:
+    백테스트가 낸 수익률·투입률을 '이 계획의 예상 성과'로 그대로 읽으려면
+    계획과 시뮬레이션의 비중·구간이 같아야 한다. 기대값 가중은 검증된 배분이 아니다.
+
+    cum_pct / avg_if_stop 은 자금 소진 시뮬레이션용이다.
+    '여기까지만 채우고 반등하면 투입률과 평균단가가 얼마인가'를 답한다.
+    """
+    px = ma200 * (1 + gap / 100)
+    half = float(band) / 2
+    total_w = float(sum(weights)) or 1.0
+    rows, cum_w, cum_cost = [], 0.0, 0.0
+    for lv, w in zip(levels_pct, weights):
+        price = ma200 * (1 + lv / 100)
+        # 현재가를 이미 지난 구간은 지금 가격으로 산다(지금보다 비싼 가격 제시 방지).
+        buy = min(price, px)
+        cum_w += w
+        cum_cost += buy * w
+        rows.append({
+            "level": float(lv),
+            "price": price,
+            "buy": buy,
+            "reached": price >= px,          # 이미 도달한 구간
+            "weight": w / total_w * 100,
+            "cum_pct": cum_w / total_w * 100,
+            "avg_if_stop": cum_cost / cum_w,
+            "lo": ma200 * (1 + (lv - half) / 100),
+            "hi": ma200 * (1 + (lv + half) / 100),
+            "wr": _zone_wr(zones, lv, band),
+            "wr_sma": _zone_wr(zones_sma, lv, band),
+        })
+    return rows
+
+
+def render_accum_plan():
+    st.subheader("📐 적립 계획 만들기")
+    st.caption("**적립 전용 백테스트**로 이 전략의 실제 수익률을 확인하고, "
+               "20·50·200일선 위치에 맞춰 어느 가격부터 얼마씩 모아갈지 계획을 만듭니다.")
+
+    if not WINZONE_DATA:
+        st.error("승률 사전계산 데이터(winzone_data.json)를 찾을 수 없어요. "
+                 "`python precompute_winzone.py` 를 먼저 실행해 주세요.")
+        return
+    if not ACCUM_DATA:
+        st.warning("적립 백테스트 데이터(accum_data.json)가 없어요. "
+                   "`python precompute_accum.py` 를 실행하면 실제 수익률까지 볼 수 있습니다. "
+                   "지금은 구간 승률만 표시합니다.")
+
+    band = float(WINZONE_META.get("band", 10))
+    target = float(WINZONE_META.get("target", 10))
+    stop = float(WINZONE_META.get("stop", 5))
+    hold = int(WINZONE_META.get("max_hold", 63))
+    breakeven = stop / (target + stop) * 100
+
+    levels_pct = [float(x) for x in (ACCUM_META.get("levels")
+                                     or [-5, -10, -15, -20, -25, -30])]
+    weight_map = ACCUM_META.get("weights") or {
+        "equal": [1] * len(levels_pct),
+        "pyramid": [1, 1, 1.5, 1.5, 2, 2][:len(levels_pct)],
+    }
+    rule_label = {
+        "sma": "200일선 복귀 시 매도",
+        "target": f"평균단가 +{target:.0f}% 도달 시 매도",
+        "hold12": "12개월 보유 후 종료",
+    }
+    scheme_label = {"equal": "균등 (1:1:1:1:1:1)", "pyramid": "하방증량 (1:1:1.5:1.5:2:2)"}
+
+    opts = sorted(WINZONE_DATA.keys(),
+                  key=lambda t: (WINZONE_DATA[t].get("market") or "",
+                                 WINZONE_DATA[t].get("name") or t))
+    flag = {"US": "🇺🇸", "KR": "🇰🇷", "ALT": "🪙", "FXB": "💱", "IDX": "📊"}
+
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        tk = st.selectbox(
+            "종목", opts,
+            format_func=lambda t: f"{flag.get(WINZONE_DATA[t].get('market'), '')} "
+                                  f"{WINZONE_DATA[t].get('name', t)} ({t})",
+            index=opts.index("AAPL") if "AAPL" in opts else 0, key="ap_tk")
+    with c2:
+        budget = st.number_input("총 투입 예산", min_value=0.0, value=1000.0, step=100.0,
+                                 key="ap_bud",
+                                 help="단위는 자유롭게 쓰세요(만원·달러 등). 같은 단위로 배분액을 보여줍니다.")
+
+    c3, c4 = st.columns(2)
+    with c3:
+        exit_rule = st.selectbox("청산 규칙", list(rule_label.keys()),
+                                 format_func=lambda k: rule_label[k], index=0, key="ap_rule",
+                                 help="백테스트와 계획이 같은 규칙을 쓰도록 여기서 고른 값이 "
+                                      "아래 결과와 사다리에 모두 적용됩니다.")
+    with c4:
+        scheme = st.selectbox("비중 방식", list(scheme_label.keys()),
+                              format_func=lambda k: scheme_label[k], index=0, key="ap_scheme")
+
+    if not st.button("📐 계획 만들기", type="primary", key="ap_go"):
+        st.info("종목을 고르고 버튼을 누르세요. (현재가 조회에 몇 초 걸립니다)")
+        return
+
+    snap = _accum_snapshot(tk)
+    if not snap:
+        st.error(f"{tk} 가격 데이터를 불러오지 못했어요. 잠시 후 다시 시도해 주세요.")
+        return
+
+    wz = WINZONE_DATA.get(tk) or {}
+    zones = wz.get("zones") or {}
+    zones_sma = wz.get("zones_sma") or {}
+    acc = ACCUM_DATA.get(tk) or {}
+    combos = acc.get("combos") or {}
+    bt = combos.get(f"{exit_rule}|{scheme}")
+
+    px, ma200 = snap["price"], snap["ma200"]
+    gap = snap["gap"]
+
+    # --- 현재 상태 ---
+    st.markdown("#### 📍 현재 위치")
+    m = st.columns(4)
+    m[0].metric("현재가", f"{px:,.2f}", f"{gap:+.1f}% (200선 대비)")
+    for col, w in zip(m[1:], (20, 50, 200)):
+        mav = snap[f"ma{w}"]
+        if mav:
+            col.metric(f"{w}일선", f"{mav:,.2f}", f"{(px / mav - 1) * 100:+.1f}%")
+        else:
+            col.metric(f"{w}일선", "-")
+
+    mas = [snap["ma20"], snap["ma50"], snap["ma200"]]
+    if all(mas):
+        if mas[0] > mas[1] > mas[2]:
+            trend = "🟢 정배열 (20 > 50 > 200) — 상승 추세"
+        elif mas[0] < mas[1] < mas[2]:
+            trend = "🔴 역배열 (20 < 50 < 200) — 하락 추세"
+        else:
+            trend = "🟡 혼재 — 추세 전환 구간일 수 있음"
+        below = [f"{w}일선" for w, v in zip((20, 50, 200), mas) if px < v]
+        st.markdown(f"{trend}  \n"
+                    f"현재가는 **{', '.join(below) if below else '모든 선'} "
+                    f"{'아래' if below else '위'}**에 있고, RSI는 {_fmt_rsi(snap['rsi'])}입니다.")
+
+    # --- 적립 백테스트 결과 (이 전략의 실제 성과) ---
+    st.markdown("#### 🎯 적립 백테스트 — 과거에 이 전략은 어땠나")
+    if bt:
+        b = st.columns(4)
+        b[0].metric("승률", f"{bt['win']:.0f}%",
+                    f"에피소드 {bt['n']}회" + (" ⚠️표본 얇음" if bt.get("thin") else ""))
+        b[1].metric("수익률 중앙값", f"{bt['ret_med']:+.1f}%",
+                    f"p25 {bt['ret_p25']:+.1f}% · p75 {bt['ret_p75']:+.1f}%")
+        b[2].metric("실제 투입률", f"{bt['inv_med']:.0f}%",
+                    f"평균 {bt['fills_med']:.1f}단계 체결")
+        b[3].metric("최대 미실현 손실", f"{bt['dd_med']:+.1f}%",
+                    f"보유 중앙 {bt['hold_med']}일")
+        if bt.get("forced_pct"):
+            st.caption(f"· 에피소드의 {bt['forced_pct']:.1f}%는 대기 상한"
+                       f"({ACCUM_META.get('max_wait_bars', 756)}거래일)에 닿아 강제 청산됐습니다.")
+
+        comp = []
+        for rk, rl in rule_label.items():
+            for sk in scheme_label:
+                s = combos.get(f"{rk}|{sk}")
+                if not s:
+                    continue
+                comp.append({
+                    "청산": rl, "비중": "균등" if sk == "equal" else "하방증량",
+                    "에피소드": f"{s['n']}회", "승률": f"{s['win']:.0f}%",
+                    "수익 중앙": f"{s['ret_med']:+.1f}%", "수익 p25": f"{s['ret_p25']:+.1f}%",
+                    "투입률": f"{s['inv_med']:.0f}%", "미실현 DD": f"{s['dd_med']:+.1f}%",
+                    "보유일": s["hold_med"],
+                    "선택": "◀" if f"{rk}|{sk}" == f"{exit_rule}|{scheme}" else "",
+                })
+        if comp:
+            with st.expander("📊 청산 규칙 × 비중 6개 조합 비교", expanded=True):
+                st.dataframe(pd.DataFrame(comp), use_container_width=True, hide_index=True)
+                st.caption(
+                    "· **'200일선 복귀'는 승률이 구조적으로 높게 나옵니다.** 200일선 아래에서 사서 "
+                    "위에서 팔기 때문입니다. 대신 수익이 작고 투입률이 낮습니다.  \n"
+                    "· **'12개월 보유'는 승률이 낮지만 수익 분포가 넓고 투입률이 높습니다.** "
+                    "종목 간 차이를 보려면 이 규칙의 변별력이 가장 큽니다.")
+
+        v1, v2 = st.columns(2)
+        with v1:
+            st.markdown("**기간 분할 검증** (200선 복귀·균등 기준)")
+            per = acc.get("by_period") or {}
+            if per.get("early") and per.get("late"):
+                e, l = per["early"], per["late"]
+                st.markdown(
+                    f"- 2016년 이전: 승률 {e['win']:.0f}% · 중앙 {e['ret_med']:+.1f}% (n={e['n']})  \n"
+                    f"- 2016년 이후: 승률 {l['win']:.0f}% · 중앙 {l['ret_med']:+.1f}% (n={l['n']})")
+                gw = abs(e["win"] - l["win"])
+                st.caption(f"두 기간 승률 차이 {gw:.0f}%p — "
+                           + ("과최적화 징후는 약합니다." if gw <= 10
+                              else "시기 의존성이 있어 주의가 필요합니다."))
+            else:
+                st.caption("표본이 부족해 기간 분할을 못 했습니다.")
+        with v2:
+            st.markdown("**50일선 조건별** (200선 복귀·균등 기준)")
+            ma50g = acc.get("by_ma50") or {}
+            shown = False
+            for kk, lbl in (("above", "진입일 50일선 위"), ("below", "진입일 50일선 아래")):
+                s = ma50g.get(kk)
+                if s:
+                    shown = True
+                    st.markdown(f"- {lbl}: 승률 {s['win']:.0f}% · 중앙 {s['ret_med']:+.1f}% "
+                                f"(n={s['n']}{' ⚠️' if s.get('thin') else ''})")
+            st.caption("200일선 -5% 아래인데 50일선 위인 경우는 드물어 '위' 표본이 매우 얇습니다. "
+                       "구분 효과를 단정하기 어렵습니다." if shown else "표본이 부족합니다.")
+    else:
+        st.info("이 종목은 적립 백테스트 결과가 없어요 (에피소드 부족 또는 데이터 미생성). "
+                "아래 사다리의 구간 승률만 참고하세요.")
+
+    # --- 적립 사다리 + 자금 소진 시뮬레이션 ---
+    weights = weight_map.get(scheme) or weight_map.get("equal") or [1] * len(levels_pct)
+    rows = _accum_levels(gap, ma200, levels_pct, weights, zones, zones_sma, band)
+
+    def line_tag(r):
+        tags = [f"{w}일선" for w, v in zip((20, 50, 200), mas)
+                if v and r["lo"] <= v < r["hi"]]
+        return " · ".join(tags) if tags else ""
+
+    def wr_txt(x):
+        return "-" if not x else f"{x[0]:.0f}% ({x[1]}건)" + (" ⚠️" if x[1] < 30 else "")
+
+    table = pd.DataFrame([{
+        "구간": f"{r['level']:+.0f}%",
+        "매수 가격": f"{r['buy']:,.2f}" + (" (지금)" if r["reached"] else ""),
+        "현재가 대비": f"{(r['buy'] / px - 1) * 100:+.1f}%",
+        "비중": f"{r['weight']:.0f}%",
+        "배분액": f"{budget * r['weight'] / 100:,.1f}" if budget else "-",
+        "누적 투입": f"{r['cum_pct']:.0f}%",
+        "여기서 멈추면 평단": f"{r['avg_if_stop']:,.2f}",
+        "평단 대비 현재가": f"{(px / r['avg_if_stop'] - 1) * 100:+.1f}%",
+        "구간승률(손절)": wr_txt(r["wr"]),
+        "구간승률(복귀)": wr_txt(r["wr_sma"]),
+        "겹치는 선": line_tag(r),
+    } for r in rows])
+    st.markdown("#### 🪜 적립 사다리 · 자금 소진 시뮬레이션")
+    st.dataframe(table, use_container_width=True, hide_index=True)
+    st.caption(
+        "· **여기서 멈추면 평단**은 그 구간까지만 채우고 반등했을 때의 평균단가입니다. "
+        "아래로 다 내려오지 않으면 예산이 남는데, 그때 실제 단가가 얼마인지 보여줍니다.  \n"
+        "· **구간승률(손절)** 은 목표 +10%/손절 -5% 기준, **구간승률(복귀)** 는 200일선 복귀 매도 "
+        "기준입니다. 적립은 손절하지 않으니 후자가 더 가깝지만, 둘 다 단발 진입 통계라 "
+        "위 백테스트가 이 계획의 실제 성과에 더 가깝습니다.")
+
+    # --- 결론 ---
+    st.markdown("#### ✅ 결론")
+    first = rows[0]
+    start_txt = ("지금 바로 — 이미 첫 구간 아래입니다"
+                 if first["reached"]
+                 else f"{first['buy']:,.2f} (현재가 대비 {(first['buy'] / px - 1) * 100:+.1f}%)")
+    lines = [f"**시작 가격**: {start_txt} — 200일선 {first['level']:+.0f}% 구간"]
+
+    stop_row = None
+    if bt:
+        for r in rows:
+            if r["cum_pct"] >= bt["inv_med"] - 1e-9:
+                stop_row = r
+                break
+    if stop_row:
+        lines.append(
+            f"**현실적 범위**: 과거 중앙 투입률이 {bt['inv_med']:.0f}%였습니다. 보통 "
+            f"**{stop_row['level']:+.0f}% 구간({stop_row['buy']:,.2f})까지** 채우고 반등했다는 뜻이고, "
+            f"그때 평균단가는 {stop_row['avg_if_stop']:,.2f} 입니다. "
+            f"예산의 약 {100 - bt['inv_med']:.0f}%는 쓰이지 않았습니다.")
+        lines.append(
+            f"**기대 성과**: 승률 {bt['win']:.0f}% · 수익률 중앙값 {bt['ret_med']:+.1f}% "
+            f"(하위 25% {bt['ret_p25']:+.1f}%) · 보유 중앙 {bt['hold_med']}일 · "
+            f"버텨야 할 미실현 손실 중앙 {bt['dd_med']:+.1f}%")
+    else:
+        lines.append("**현실적 범위**: 백테스트 결과가 없어 투입률을 추정할 수 없습니다. "
+                     "사다리의 '누적 투입' 열로 직접 판단하세요.")
+    st.success("  \n".join(lines))
+
+    rec = RECOVERY_DATA.get(tk) or {}
+    if rec.get("rec_avg") is not None:
+        o2 = float(rec.get("over_2w", 0))
+        st.markdown(
+            f"**모을 시간**: 200일선을 이탈하면 평균 {float(rec['rec_avg']):.0f}일, "
+            f"중앙값 {float(rec.get('rec_med', 0)):.0f}일 만에 복귀했습니다. "
+            f"2주를 넘긴 비율은 **{o2:.0f}%** 라서, "
+            + ("분할매수 시간이 넉넉한 편입니다." if o2 >= 33 else
+               "생각보다 빨리 올라와 아래 구간까지 다 못 채울 가능성이 큽니다."))
+
+    with st.expander("⚠️ 이 계획을 믿기 전에 꼭 볼 것", expanded=False):
+        st.markdown(f"""
+- **백테스트가 재는 것**: 200일선 -5% 이탈 시 시작해
+  {', '.join(f'{l:+.0f}%' for l in levels_pct)} 구간에서 분할 매수하고, **손절 없이**
+  선택한 청산 규칙까지 보유하는 전략입니다. 겹치지 않는 에피소드로 집계하고,
+  데이터 끝까지 청산되지 않은 마지막 구간은 제외했습니다.
+- **'200일선 복귀' 승률은 구조적으로 높습니다.** 200일선 아래에서 사서 위에서 팔기
+  때문입니다. 손실이 나는 경우는 200일선 자체가 계속 내려와 낮아진 선을 회복했을 때입니다.
+  종목 간 실력 차이를 보려면 **'12개월 보유'** 쪽 숫자를 보세요.
+- **'평균단가 +{target:.0f}%' 승률은 거의 100%로 나와 변별력이 없습니다.** 도달하면 정의상
+  +{target:.0f}%이고, 3년 상한에 닿는 경우가 드물기 때문입니다. 수익률 대신
+  **보유일과 투입률**을 보세요.
+- **가격표는 매일 바뀝니다.** 각 구간 가격은 오늘의 200일선({ma200:,.2f})에 괴리율을 적용한
+  값입니다. 200일선이 움직이면 가격표도 움직이니 절대 가격으로 예약주문을 걸면 어긋납니다.
+- **50일선 구분은 결론을 내지 못했습니다.** 200일선 -5% 아래이면서 50일선 위인 경우가
+  드물어 표본이 한 자리 수입니다. 참고만 하세요.
+- **생존자 편향이 남아 있습니다.** 유니버스가 현재 시총 상위 종목이라, 과거에 밀려나거나
+  상장폐지된 종목이 표본에 없습니다. 실제보다 낙관적으로 나올 수 있습니다.
+- **구간승률(손절/복귀)** 은 단발 진입 통계라 적립 전략과 정의가 다릅니다. 손절 기준의
+  손익분기 승률은 {breakeven:.0f}%({hold}거래일 기준)이고, 참고 지표로만 쓰세요.
+- 과거 통계이고 투자 권유가 아닙니다. 펀더멘털이 훼손된 하락은 통계가 설명하지 못합니다.
+        """)
+
+    val = wz.get("val") or {}
+    if val.get("grade"):
+        per = val.get("per")
+        per_txt = f"{float(per):.1f}" if isinstance(per, (int, float)) else "-"
+        st.caption(f"· 밸류에이션 참고: {val['grade']} (PER {per_txt}) "
+                   "— 고평가 구간이면 하락 폭이 통계보다 깊을 수 있어요.")
+    st.caption(
+        f"· 가격 기준일 {snap['asof']} · 200일선 {ma200:,.2f} 기준 환산  \n"
+        f"· 적립 백테스트 생성일 {str(ACCUM_META.get('generated_at', '미생성'))[:10]} "
+        f"(에피소드 {acc.get('episodes_total', '-')}회, 데이터 시작 {acc.get('history_start', '-')})  \n"
+        f"· 구간 승률 데이터 생성일 {str(WINZONE_META.get('generated_at', '미기록'))[:10]}")
+
+
 # --- 사이드바: 리소스 관리 ---
 with st.sidebar:
     st.markdown("### ⚙️ 설정")
@@ -2755,9 +3128,11 @@ group1, group2, group3, group4 = st.tabs([
 ])
 
 with group1:
-    sub = st.tabs(["🎯 위치별 승률 스크리너", "🪙 크립토 200일선+MVRV"])
+    sub = st.tabs(["🎯 위치별 승률 스크리너", "📐 적립 계획", "🪙 크립토 200일선+MVRV"])
     tab1 = sub[0]
     with sub[1]:
+        render_accum_plan()
+    with sub[2]:
         render_crypto_screener()
 
 with group2:
