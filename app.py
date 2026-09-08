@@ -2752,28 +2752,130 @@ st.title("📈 200일선 투자 도구 모음")
 # ============================================================
 # 추가 도구 7: 적립 계획 만들기 (위치별 승률 × 20/50/200일선)
 # ============================================================
-@st.cache_data(ttl=1800, show_spinner=False, max_entries=60)
-def _accum_snapshot(ticker):
-    """현재가와 20/50/200일선, 괴리율, RSI를 한 번에 계산."""
-    df = _safe_dl(ticker, "2y")
-    if df is None or len(df) < 201:
-        return None
-    close = df["Close"]
-    rsi = _rsi_wilder(close)
+def _norm_zones(z):
+    """구간 키를 문자열 정수로 통일. 실시간 계산은 int 키, JSON 로드는 str 키를 준다."""
+    out = {}
+    for k, v in (z or {}).items():
+        try:
+            out[str(int(round(float(k))))] = v
+        except (TypeError, ValueError):
+            out[str(k)] = v
+    return out
 
-    def last_ma(window):
-        if len(close) < window:
-            return None
-        v = float(close.rolling(window).mean().iloc[-1])
-        return v if v == v else None
+
+@st.cache_data(ttl=1800, show_spinner=False, max_entries=40)
+def _accum_realtime(ticker):
+    """티커 하나를 실시간으로 전부 계산한다. 다운로드 1회로 네 가지를 만든다.
+
+    사전계산 파일에 없는 종목도 조회할 수 있고 기준일이 오늘로 통일된다.
+    실측 결과 계산 자체는 0.01초 수준이고 병목은 다운로드(0.3~0.9초)뿐이라,
+    종목 하나만 보는 이 탭에서는 사전계산을 유지할 이유가 없다.
+
+    히스토리는 상장 전체 기간(period=max)을 쓴다. recovery_cycles.py 와 같은
+    기준이지만, '위치별 승률 스크리너' 탭이 쓰는 winzone_data.json 은
+    2000-01-01 이후만 집계하므로 같은 종목의 구간 승률이 탭마다 다를 수 있다.
+    """
+    import precompute_accum as _pa
+    import precompute_winzone as _pw
+    import precompute_recovery as _pr
+
+    close = _pa.load_close(ticker)
+    if close is None or len(close) < _pa.SMA_LONG + 60:
+        return None
+
+    ma_l = close.rolling(_pa.SMA_LONG).mean()
+    ma_m = close.rolling(_pa.SMA_MID).mean()
+    ma_s = close.rolling(_pa.SMA_SHORT).mean()
+    valid = ma_l.notna() & ma_m.notna() & ma_s.notna()
+    if int(valid.sum()) < 60:
+        return None
 
     px = float(close.iloc[-1])
-    ma200 = last_ma(200)
-    if not ma200:
+    ma200 = float(ma_l.iloc[-1])
+    if not ma200 or ma200 != ma200:
         return None
-    return {"price": px, "ma20": last_ma(20), "ma50": last_ma(50), "ma200": ma200,
-            "gap": (px / ma200 - 1) * 100, "rsi": rsi,
-            "asof": str(close.index[-1])[:10]}
+    snap = {
+        "price": px,
+        "ma20": float(ma_s.iloc[-1]) if bool(ma_s.notna().iloc[-1]) else None,
+        "ma50": float(ma_m.iloc[-1]) if bool(ma_m.notna().iloc[-1]) else None,
+        "ma200": ma200,
+        "gap": (px / ma200 - 1) * 100,
+        "rsi": _rsi_wilder(close),
+        "asof": str(close.index[-1])[:10],
+    }
+
+    # 적립 백테스트 (청산 3종 × 비중 2종)
+    d = close.index[valid]
+    c = close[valid].to_numpy(float)
+    l = ma_l[valid].to_numpy(float)
+    m = ma_m[valid].to_numpy(float)
+    s = ma_s[valid].to_numpy(float)
+    combos, primary = {}, None
+    for rule in _pa.EXIT_RULES:
+        for wname, w in _pa.WEIGHTS.items():
+            eps = _pa.simulate(d, c, l, m, s, w, rule)
+            summ = _pa.summarize(eps)
+            if summ:
+                combos[f"{rule}|{wname}"] = summ
+            if rule == "sma" and wname == "equal":
+                primary = eps
+    acc = {"combos": combos, "history_start": str(close.index[0])[:10],
+           "episodes_total": len(primary or [])}
+    if primary:
+        acc["by_ma50"] = {
+            "above": _pa.summarize([e for e in primary if e["ma_mid_above"]]),
+            "below": _pa.summarize([e for e in primary if not e["ma_mid_above"]]),
+        }
+        acc["by_period"] = {
+            "early": _pa.summarize([e for e in primary if e["start"] < _pa.PERIOD_SPLIT]),
+            "late": _pa.summarize([e for e in primary if e["start"] >= _pa.PERIOD_SPLIT]),
+        }
+
+    try:
+        zt, zs = _pw.zone_winrates(close.to_numpy(float))
+    except Exception:
+        zt, zs = {}, {}
+    try:
+        rec = _pr.recovery_stats(close) or {}
+    except Exception:
+        rec = {}
+
+    return {
+        "snap": snap, "acc": acc, "rec": rec,
+        "zones": _norm_zones(zt), "zones_sma": _norm_zones(zs),
+        "meta": {
+            "levels": list(_pa.LEVELS), "weights": dict(_pa.WEIGHTS),
+            "max_wait_bars": _pa.MAX_WAIT_BARS, "period_split": _pa.PERIOD_SPLIT,
+            "min_episodes": _pa.MIN_EPISODES,
+            "target": float(_pw.TARGET_PCT), "stop": float(_pw.STOP_PCT),
+            "band": float(_pw.BAND_WIDTH), "max_hold": int(_pw.MAX_HOLD),
+        },
+    }
+
+
+def _accum_resolve(query):
+    """입력(티커·종목코드·한글 기업명)을 yfinance 티커로 변환.
+
+    반환: {"status": "ok"|"candidates"|"none", ...}
+    """
+    import re
+
+    q = (query or "").strip()
+    if not q:
+        return {"status": "none"}
+    if re.fullmatch(r"\d{6}", q):
+        return {"status": "ok", "ticker": _kr_ticker(q), "name": q, "note": None}
+    if _has_korean(q) or not _looks_like_ticker(q):
+        kind, payload, *rest = (*resolve_korean_name(q), None)
+        if kind == "code":
+            name = rest[0] if rest else q
+            return {"status": "ok", "ticker": _kr_ticker(payload), "name": name,
+                    "note": f"'{q}' → **{name} ({payload})** 로 변환했어요."}
+        if kind == "candidates":
+            return {"status": "candidates", "cands": payload}
+        return {"status": "none"}
+    up = q.upper()
+    return {"status": "ok", "ticker": up, "name": up, "note": None}
 
 
 def _zone_wr(zones, level, band):
@@ -2833,46 +2935,18 @@ def render_accum_plan():
     st.caption("**적립 전용 백테스트**로 이 전략의 실제 수익률을 확인하고, "
                "20·50·200일선 위치에 맞춰 어느 가격부터 얼마씩 모아갈지 계획을 만듭니다.")
 
-    if not WINZONE_DATA:
-        st.error("승률 사전계산 데이터(winzone_data.json)를 찾을 수 없어요. "
-                 "`python precompute_winzone.py` 를 먼저 실행해 주세요.")
-        return
-    if not ACCUM_DATA:
-        st.warning("적립 백테스트 데이터(accum_data.json)가 없어요. "
-                   "`python precompute_accum.py` 를 실행하면 실제 수익률까지 볼 수 있습니다. "
-                   "지금은 구간 승률만 표시합니다.")
-
-    band = float(WINZONE_META.get("band", 10))
-    target = float(WINZONE_META.get("target", 10))
-    stop = float(WINZONE_META.get("stop", 5))
-    hold = int(WINZONE_META.get("max_hold", 63))
-    breakeven = stop / (target + stop) * 100
-
-    levels_pct = [float(x) for x in (ACCUM_META.get("levels")
-                                     or [-5, -10, -15, -20, -25, -30])]
-    weight_map = ACCUM_META.get("weights") or {
-        "equal": [1] * len(levels_pct),
-        "pyramid": [1, 1, 1.5, 1.5, 2, 2][:len(levels_pct)],
-    }
     rule_label = {
         "sma": "200일선 복귀 시 매도",
-        "target": f"평균단가 +{target:.0f}% 도달 시 매도",
+        "target": "평균단가 +10% 도달 시 매도",
         "hold12": "12개월 보유 후 종료",
     }
     scheme_label = {"equal": "균등 (1:1:1:1:1:1)", "pyramid": "하방증량 (1:1:1.5:1.5:2:2)"}
 
-    opts = sorted(WINZONE_DATA.keys(),
-                  key=lambda t: (WINZONE_DATA[t].get("market") or "",
-                                 WINZONE_DATA[t].get("name") or t))
-    flag = {"US": "🇺🇸", "KR": "🇰🇷", "ALT": "🪙", "FXB": "💱", "IDX": "📊"}
-
     c1, c2 = st.columns([2, 1])
     with c1:
-        tk = st.selectbox(
-            "종목", opts,
-            format_func=lambda t: f"{flag.get(WINZONE_DATA[t].get('market'), '')} "
-                                  f"{WINZONE_DATA[t].get('name', t)} ({t})",
-            index=opts.index("AAPL") if "AAPL" in opts else 0, key="ap_tk")
+        query = st.text_input("종목 티커 / 종목코드 / 기업명", value="AAPL",
+                              placeholder="예: AAPL, TQQQ, BTC-USD, 005930, 삼성전자",
+                              key="ap_q")
     with c2:
         budget = st.number_input("총 투입 예산", min_value=0.0, value=1000.0, step=100.0,
                                  key="ap_bud",
@@ -2889,20 +2963,48 @@ def render_accum_plan():
                               format_func=lambda k: scheme_label[k], index=0, key="ap_scheme")
 
     if not st.button("📐 계획 만들기", type="primary", key="ap_go"):
-        st.info("종목을 고르고 버튼을 누르세요. (현재가 조회에 몇 초 걸립니다)")
+        st.info("종목을 입력하고 버튼을 누르세요. 사전계산 목록에 없는 종목도 조회됩니다. "
+                "(전체 기간을 실시간 계산하며 보통 1~3초)")
         return
 
-    snap = _accum_snapshot(tk)
-    if not snap:
-        st.error(f"{tk} 가격 데이터를 불러오지 못했어요. 잠시 후 다시 시도해 주세요.")
+    res = _accum_resolve(query)
+    if res["status"] == "candidates":
+        cands = res["cands"]
+        st.warning(f"'{query}' 와 일치하는 종목이 여러 개예요. 하나를 골라 다시 눌러주세요.")
+        options = [f"{name} ({code}) · {market}" for code, name, market in cands]
+        chosen = st.selectbox("종목 선택", options, key="ap_cand")
+        code, name, market = cands[options.index(chosen)]
+        tk, tk_name = _kr_ticker(code, market), name
+        st.caption(f"선택: {name} ({code}) → `{tk}`")
+    elif res["status"] == "ok":
+        tk, tk_name = res["ticker"], res["name"]
+        if res.get("note"):
+            st.info("🇰🇷 " + res["note"])
+    else:
+        st.error(f"'{query}' 로 종목을 찾지 못했어요. 티커나 6자리 종목코드로 시도해 보세요 "
+                 "(예: `AAPL`, `005930`).")
         return
 
-    wz = WINZONE_DATA.get(tk) or {}
-    zones = wz.get("zones") or {}
-    zones_sma = wz.get("zones_sma") or {}
-    acc = ACCUM_DATA.get(tk) or {}
+    with st.spinner(f"{tk} 전체 기간을 계산하는 중…"):
+        rt = _accum_realtime(tk)
+    if not rt:
+        st.error(f"`{tk}` 가격 데이터를 불러오지 못했거나 200일선을 만들 만큼 "
+                 "기간이 길지 않아요. 상장 1년 미만이면 계산할 수 없습니다.")
+        return
+
+    snap, acc, rec = rt["snap"], rt["acc"], rt["rec"]
+    zones, zones_sma = rt["zones"], rt["zones_sma"]
+    rmeta = rt["meta"]
+    band, target, stop = rmeta["band"], rmeta["target"], rmeta["stop"]
+    hold = rmeta["max_hold"]
+    breakeven = stop / (target + stop) * 100
+    levels_pct = [float(x) for x in rmeta["levels"]]
+    weight_map = rmeta["weights"]
     combos = acc.get("combos") or {}
     bt = combos.get(f"{exit_rule}|{scheme}")
+    wz = WINZONE_DATA.get(tk) or {}      # 밸류에이션 참고용 (사전계산에 있으면)
+    st.caption(f"조회 종목: **{tk_name}** (`{tk}`) · 데이터 {acc.get('history_start', '-')} ~ "
+               f"{snap['asof']} · 실시간 계산")
 
     px, ma200 = snap["price"], snap["ma200"]
     gap = snap["gap"]
@@ -2933,19 +3035,27 @@ def render_accum_plan():
 
     # --- 적립 백테스트 결과 (이 전략의 실제 성과) ---
     st.markdown("#### 🎯 적립 백테스트 — 과거에 이 전략은 어땠나")
-    if bt:
-        b = st.columns(4)
-        b[0].metric("승률", f"{bt['win']:.0f}%",
-                    f"에피소드 {bt['n']}회" + (" ⚠️표본 얇음" if bt.get("thin") else ""))
-        b[1].metric("수익률 중앙값", f"{bt['ret_med']:+.1f}%",
-                    f"p25 {bt['ret_p25']:+.1f}% · p75 {bt['ret_p75']:+.1f}%")
-        b[2].metric("실제 투입률", f"{bt['inv_med']:.0f}%",
-                    f"평균 {bt['fills_med']:.1f}단계 체결")
-        b[3].metric("최대 미실현 손실", f"{bt['dd_med']:+.1f}%",
-                    f"보유 중앙 {bt['hold_med']}일")
-        if bt.get("forced_pct"):
-            st.caption(f"· 에피소드의 {bt['forced_pct']:.1f}%는 대기 상한"
-                       f"({ACCUM_META.get('max_wait_bars', 756)}거래일)에 닿아 강제 청산됐습니다.")
+    if combos:
+        if bt:
+            b = st.columns(4)
+            b[0].metric("승률", f"{bt['win']:.0f}%",
+                        f"에피소드 {bt['n']}회" + (" ⚠️표본 얇음" if bt.get("thin") else ""))
+            b[1].metric("수익률 중앙값", f"{bt['ret_med']:+.1f}%",
+                        f"p25 {bt['ret_p25']:+.1f}% · p75 {bt['ret_p75']:+.1f}%")
+            b[2].metric("실제 투입률", f"{bt['inv_med']:.0f}%",
+                        f"평균 {bt['fills_med']:.1f}단계 체결")
+            b[3].metric("최대 미실현 손실", f"{bt['dd_med']:+.1f}%",
+                        f"보유 중앙 {bt['hold_med']}일")
+            if bt.get("forced_pct"):
+                st.caption(f"· 에피소드의 {bt['forced_pct']:.1f}%는 대기 상한"
+                           f"({rmeta['max_wait_bars']}거래일)에 닿아 강제 청산됐습니다.")
+        else:
+            st.warning(
+                f"고른 조합(**{rule_label[exit_rule]} · "
+                f"{'균등' if scheme == 'equal' else '하방증량'}**)은 에피소드가 "
+                f"{rmeta['min_episodes']}개 미만이라 통계를 내지 않았어요. "
+                "상장 기간이 짧거나 청산까지 오래 걸리는 규칙이면 표본이 부족합니다. "
+                "아래 표에서 집계된 조합을 확인해 다시 골라보세요.")
 
         comp = []
         for rk, rl in rule_label.items():
@@ -2998,7 +3108,9 @@ def render_accum_plan():
             st.caption("200일선 -5% 아래인데 50일선 위인 경우는 드물어 '위' 표본이 매우 얇습니다. "
                        "구분 효과를 단정하기 어렵습니다." if shown else "표본이 부족합니다.")
     else:
-        st.info("이 종목은 적립 백테스트 결과가 없어요 (에피소드 부족 또는 데이터 미생성). "
+        st.info(f"이 종목은 어떤 조합도 에피소드가 {rmeta['min_episodes']}개를 넘지 못했어요 "
+                f"(전체 이탈→복귀 {acc.get('episodes_total', 0)}회). "
+                "상장 기간이 짧으면 200일선 사이클 자체가 적습니다. "
                 "아래 사다리의 구간 승률만 참고하세요.")
 
     # --- 적립 사다리 + 자금 소진 시뮬레이션 ---
@@ -3064,7 +3176,6 @@ def render_accum_plan():
                      "사다리의 '누적 투입' 열로 직접 판단하세요.")
     st.success("  \n".join(lines))
 
-    rec = RECOVERY_DATA.get(tk) or {}
     if rec.get("rec_avg") is not None:
         o2 = float(rec.get("over_2w", 0))
         st.markdown(
@@ -3105,9 +3216,11 @@ def render_accum_plan():
                    "— 고평가 구간이면 하락 폭이 통계보다 깊을 수 있어요.")
     st.caption(
         f"· 가격 기준일 {snap['asof']} · 200일선 {ma200:,.2f} 기준 환산  \n"
-        f"· 적립 백테스트 생성일 {str(ACCUM_META.get('generated_at', '미생성'))[:10]} "
-        f"(에피소드 {acc.get('episodes_total', '-')}회, 데이터 시작 {acc.get('history_start', '-')})  \n"
-        f"· 구간 승률 데이터 생성일 {str(WINZONE_META.get('generated_at', '미기록'))[:10]}")
+        f"· 백테스트·구간승률·복귀통계 모두 **이번 조회 시점에 실시간 계산**했습니다 "
+        f"(상장 전체 기간 {acc.get('history_start', '-')} 부터, 에피소드 "
+        f"{acc.get('episodes_total', '-')}회). 결과는 30분간 캐시됩니다.  \n"
+        f"· 구간 승률은 전체 기간 기준이라, 2000년 이후만 집계하는 "
+        f"'위치별 승률 스크리너' 탭과 같은 종목에서 값이 다를 수 있어요.")
 
 
 # --- 사이드바: 리소스 관리 ---
