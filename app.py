@@ -2840,8 +2840,43 @@ def _accum_realtime(ticker):
     except Exception:
         rec = {}
 
+    # --- 지금 진행 중인 200일선 이탈 구간이 과거 분포에서 어디쯤인지 ---
+    # 한 번의 순회로 과거 복귀 소요일 분포와 '아직 안 끝난 마지막 구간'을 함께 얻는다.
+    durations, open_i = [], None
+    for i in range(len(c)):
+        if open_i is None:
+            if c[i] < l[i]:
+                open_i = i
+        elif c[i] > l[i]:
+            durations.append((d[i] - d[open_i]).days)
+            open_i = None
+
+    ep = {"below": open_i is not None}
+    darr = np.asarray(durations, float) if durations else None
+    if darr is not None and darr.size:
+        ep.update(dur_n=int(darr.size), dur_med=float(np.median(darr)),
+                  dur_avg=float(darr.mean()), dur_max=int(darr.max()))
+    if open_i is not None:
+        seg_gap = (c[open_i:] / l[open_i:] - 1) * 100
+        t = int(np.argmin(seg_gap))
+        days = int((d[-1] - d[open_i]).days)
+        trough_gap = float(seg_gap[t])
+        trough_px = float(c[open_i + t])
+        ep.update(
+            start=str(d[open_i])[:10], days=days,
+            trough_gap=trough_gap, trough_date=str(d[open_i + t])[:10],
+            trough_px=trough_px,
+            rebound=(px / trough_px - 1) * 100,
+            to_ma200=(ma200 / px - 1) * 100,
+            # 최저 괴리율에서 200일선(0%)까지의 거리 중 되돌린 비율
+            progress=(0.0 if trough_gap >= 0 else max(0.0, min(
+                100.0, (snap["gap"] - trough_gap) / (0 - trough_gap) * 100))),
+        )
+        if darr is not None and darr.size:
+            ep["pct_shorter"] = float((darr <= days).mean() * 100)
+
     return {
-        "snap": snap, "acc": acc, "rec": rec,
+        "snap": snap, "acc": acc, "rec": rec, "episode": ep,
         "zones": _norm_zones(zt), "zones_sma": _norm_zones(zs),
         "meta": {
             "levels": list(_pa.LEVELS), "weights": dict(_pa.WEIGHTS),
@@ -3086,6 +3121,56 @@ def render_accum_plan():
         st.markdown(f"{trend}  \n"
                     f"현재가는 **{', '.join(below) if below else '모든 선'} "
                     f"{'아래' if below else '위'}**에 있고, RSI는 {_fmt_rsi(snap['rsi'])}입니다.")
+
+    # --- 지금 이탈 구간이 과거 분포에서 어디쯤인가 ---
+    ep = rt.get("episode") or {}
+    st.markdown("#### ⏳ 지금 이탈 구간은 어디쯤인가")
+    if not ep.get("below"):
+        st.success(f"현재 **200일선 위**({gap:+.1f}%)라 진행 중인 이탈 구간이 없습니다. "
+                   "아래 사다리는 앞으로 내려올 경우의 계획입니다."
+                   + (f" 과거 이탈은 {ep['dur_n']}회였고 중앙 {ep['dur_med']:.0f}일 · "
+                      f"평균 {ep['dur_avg']:.0f}일 만에 복귀했습니다."
+                      if ep.get("dur_n") else ""))
+    else:
+        e = st.columns(4)
+        e[0].metric("이탈 경과", f"{ep['days']}일", f"{ep['start']} 이탈", delta_color="off")
+        if ep.get("dur_med"):
+            e[1].metric("과거 중앙 복귀일", f"{ep['dur_med']:.0f}일",
+                        f"경과율 {ep['days'] / ep['dur_med'] * 100:.0f}% · "
+                        f"평균 {ep['dur_avg']:.0f}일", delta_color="off")
+        else:
+            e[1].metric("과거 중앙 복귀일", "-", "과거 이탈 표본 없음", delta_color="off")
+        e[2].metric("최저점 대비 반등", f"{ep['rebound']:+.1f}%",
+                    f"최저 {ep['trough_gap']:+.1f}% ({ep['trough_date']})")
+        e[3].metric("200일선까지", f"+{ep['to_ma200']:.1f}%",
+                    f"회복 진행률 {ep['progress']:.0f}%", delta_color="off")
+
+        msgs = []
+        if ep.get("pct_shorter") is not None:
+            msgs.append(f"과거 이탈 {ep['dur_n']}회 중 "
+                        f"**{ep['pct_shorter']:.0f}%가 지금({ep['days']}일)보다 짧게** 끝났습니다.")
+        if ep.get("dur_med"):
+            if ep["days"] > ep["dur_max"]:
+                msgs.append(f"역대 최장 기록({ep['dur_max']}일)을 넘겼습니다. "
+                            "통계 범위를 벗어난 구간이라 과거 수치로 판단하기 어렵습니다. "
+                            "펀더멘털 훼손 여부를 먼저 확인하세요.")
+            elif ep["days"] > ep["dur_avg"]:
+                msgs.append(f"평균({ep['dur_avg']:.0f}일)을 넘긴 **장기화 구간**입니다. "
+                            "아래 구간까지 채울 시간이 남아 있을 가능성이 큽니다.")
+            elif ep["days"] > ep["dur_med"]:
+                msgs.append(f"중앙값({ep['dur_med']:.0f}일)은 넘겼지만 "
+                            f"평균({ep['dur_avg']:.0f}일) 이내입니다.")
+            else:
+                msgs.append(f"중앙값({ep['dur_med']:.0f}일) 이내로 **아직 이른 구간**입니다. "
+                            "빠르게 복귀하면 아래 구간을 못 채울 수 있습니다.")
+        if ep["progress"] >= 50:
+            msgs.append(f"최저점에서 200일선까지 거리의 **{ep['progress']:.0f}%를 회복**해 "
+                        "반등이 진행 중입니다. 더 내려오길 기다리면 못 살 수 있습니다.")
+        elif ep["progress"] <= 10:
+            msgs.append(f"아직 최저점 근처입니다(최저 {ep['trough_gap']:+.1f}%). "
+                        "추가 하락 여지를 감안해 나눠 들어가는 편이 안전합니다.")
+        if msgs:
+            st.info("  \n".join(msgs))
 
     # --- 적립 백테스트 결과 (이 전략의 실제 성과) ---
     st.markdown("#### 🎯 적립 백테스트 — 과거에 이 전략은 어땠나")
