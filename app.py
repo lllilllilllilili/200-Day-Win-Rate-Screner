@@ -2841,18 +2841,25 @@ def _accum_realtime(ticker):
         rec = {}
 
     # --- 지금 진행 중인 200일선 이탈 구간이 과거 분포에서 어디쯤인지 ---
-    # 한 번의 순회로 과거 복귀 소요일 분포와 '아직 안 끝난 마지막 구간'을 함께 얻는다.
-    durations, open_i = [], None
+    # 한 번의 순회로 과거 이탈 구간 기록과 '아직 안 끝난 마지막 구간'을 함께 얻는다.
+    # 구간마다 소요일·최저 괴리율·최저점 도달 시점을 남겨 조건부 분석에 쓴다.
+    hist, open_i = [], None
     for i in range(len(c)):
         if open_i is None:
             if c[i] < l[i]:
                 open_i = i
         elif c[i] > l[i]:
-            durations.append((d[i] - d[open_i]).days)
+            seg = (c[open_i:i] / l[open_i:i] - 1) * 100
+            ti = int(np.argmin(seg)) if seg.size else 0
+            hist.append({
+                "days": int((d[i] - d[open_i]).days),
+                "trough": float(seg.min()) if seg.size else 0.0,
+                "t_days": int((d[open_i + ti] - d[open_i]).days),
+            })
             open_i = None
 
     ep = {"below": open_i is not None}
-    darr = np.asarray(durations, float) if durations else None
+    darr = np.asarray([h["days"] for h in hist], float) if hist else None
     if darr is not None and darr.size:
         ep.update(dur_n=int(darr.size), dur_med=float(np.median(darr)),
                   dur_avg=float(darr.mean()), dur_max=int(darr.max()))
@@ -2874,6 +2881,24 @@ def _accum_realtime(ticker):
         )
         if darr is not None and darr.size:
             ep["pct_shorter"] = float((darr <= days).mean() * 100)
+
+        # 조건부 전망: '이미 days 일을 버틴' 과거 구간만 골라 남은 기간과 깊이를 본다.
+        # 전체 평균은 이미 지나간 짧은 구간까지 섞여 있어 지금 상황을 과소평가한다.
+        tail = [h for h in hist if h["days"] >= days]
+        if len(tail) >= 3:
+            td = np.asarray([h["days"] for h in tail], float)
+            tg = np.asarray([h["trough"] for h in tail], float)
+            tt = np.asarray([h["t_days"] for h in tail], float)
+            ep["cond"] = {
+                "n": len(tail),
+                "med": float(np.median(td)),
+                "p75": float(np.percentile(td, 75)),
+                "p90": float(np.percentile(td, 90)),
+                "max": int(td.max()),
+                "trough_med": float(np.median(tg)),
+                "trough_p25": float(np.percentile(tg, 25)),
+                "t_days_med": float(np.median(tt)),
+            }
 
     return {
         "snap": snap, "acc": acc, "rec": rec, "episode": ep,
@@ -3171,6 +3196,74 @@ def render_accum_plan():
                         "추가 하락 여지를 감안해 나눠 들어가는 편이 안전합니다.")
         if msgs:
             st.info("  \n".join(msgs))
+
+        # --- 조건부 전망: 이미 이만큼 버틴 구간들은 이후 어떻게 됐나 ---
+        cd = ep.get("cond")
+        if cd:
+            longish = ep["days"] > ep.get("dur_avg", 0)
+            with st.expander(
+                    f"📅 이대로 길어지면 며칠까지 보나 — {ep['days']}일 이상 갔던 과거 "
+                    f"{cd['n']}회 기준", expanded=longish):
+                horizon = pd.DataFrame([
+                    {"기준": "중앙값 (절반이 이 안에 끝남)", "총 소요": f"{cd['med']:.0f}일",
+                     "지금부터 남은 기간": f"+{max(0, cd['med'] - ep['days']):.0f}일",
+                     "예상 복귀 시점": str((pd.Timestamp(ep['start'])
+                                       + pd.Timedelta(days=cd['med'])).date())},
+                    {"기준": "상위 25% (길어지는 경우)", "총 소요": f"{cd['p75']:.0f}일",
+                     "지금부터 남은 기간": f"+{max(0, cd['p75'] - ep['days']):.0f}일",
+                     "예상 복귀 시점": str((pd.Timestamp(ep['start'])
+                                       + pd.Timedelta(days=cd['p75'])).date())},
+                    {"기준": "상위 10% (많이 길어지는 경우)", "총 소요": f"{cd['p90']:.0f}일",
+                     "지금부터 남은 기간": f"+{max(0, cd['p90'] - ep['days']):.0f}일",
+                     "예상 복귀 시점": str((pd.Timestamp(ep['start'])
+                                       + pd.Timedelta(days=cd['p90'])).date())},
+                    {"기준": "최악 (이 조건 표본 중 최장)", "총 소요": f"{cd['max']}일",
+                     "지금부터 남은 기간": f"+{max(0, cd['max'] - ep['days']):.0f}일",
+                     "예상 복귀 시점": str((pd.Timestamp(ep['start'])
+                                       + pd.Timedelta(days=cd['max'])).date())},
+                ])
+                st.dataframe(horizon, use_container_width=True, hide_index=True)
+
+                notes = [
+                    f"**얼마나 깊어졌나** — 이만큼 길어진 구간들은 최저 괴리율 "
+                    f"중앙 **{cd['trough_med']:+.1f}%**, 넷 중 하나는 "
+                    f"**{cd['trough_p25']:+.1f}% 보다 깊게** 내려갔습니다. "
+                    f"지금은 {gap:+.1f}%, 이번 구간 최저는 {ep['trough_gap']:+.1f}% 입니다."
+                ]
+                deepest = min(levels_pct)
+                if cd["trough_p25"] < deepest:
+                    notes.append(
+                        f"**사다리 밖 하락 대비** — 25% 케이스가 사다리 최하단"
+                        f"({deepest:+.0f}%)보다 깊습니다. 마지막 구간에 예산을 다 쓰지 말고 "
+                        f"여유를 남기는 편이 안전합니다.")
+                else:
+                    notes.append(
+                        f"**사다리 깊이** — 25% 케이스도 사다리 최하단({deepest:+.0f}%) 안쪽이라 "
+                        f"지금 구간 구성으로 대응 가능한 범위입니다.")
+
+                if cd["t_days_med"] < ep["days"]:
+                    notes.append(
+                        f"**저점 시점** — 이만큼 길어진 구간들은 이탈 후 중앙 "
+                        f"**{cd['t_days_med']:.0f}일째**에 최저를 찍었습니다. 지금은 "
+                        f"{ep['days']}일째라 **저점을 이미 지났을 가능성**이 있습니다. "
+                        f"남은 구간을 기다리다 못 살 수 있으니 분할 속도를 앞당기는 것도 방법입니다.")
+                else:
+                    notes.append(
+                        f"**저점 시점** — 이만큼 길어진 구간들은 이탈 후 중앙 "
+                        f"**{cd['t_days_med']:.0f}일째**에 최저를 찍었습니다. 지금은 "
+                        f"{ep['days']}일째로 **저점이 아직 남았을 수 있습니다.** "
+                        f"아래 구간 예산을 지켜두세요.")
+
+                st.markdown("  \n".join(f"- {n}" for n in notes))
+                st.caption(
+                    f"· 전체 이탈 {ep.get('dur_n', 0)}회 중 {ep['days']}일 이상 지속된 "
+                    f"{cd['n']}회만 골라 계산했습니다. 이미 짧게 끝난 구간을 섞으면 지금 상황을 "
+                    "과소평가하게 됩니다.  \n"
+                    "· '예상 복귀 시점'은 이탈 시작일에 과거 소요일을 더한 값이라 달력 기준 "
+                    "참고치입니다. 표본이 적으면(10회 미만) 넓게 보세요.")
+        elif ep.get("dur_n"):
+            st.caption(f"· {ep['days']}일 이상 지속된 과거 구간이 3회 미만이라 "
+                       "조건부 전망을 내지 않았습니다. 이 종목에서는 드문 길이입니다.")
 
     # --- 적립 백테스트 결과 (이 전략의 실제 성과) ---
     st.markdown("#### 🎯 적립 백테스트 — 과거에 이 전략은 어땠나")
