@@ -19,6 +19,8 @@
           pyramid = 1 : 1 : 1.5 : 1.5 : 2 : 2   (하방증량)
   청산    sma     = 종가가 200일선 위로 복귀한 날
           target  = 종가가 그때까지의 평균단가 +10% 에 닿은 날
+          hold3   = 진입 후 63거래일(약 3개월) 경과
+          hold6   = 진입 후 126거래일(약 6개월) 경과
           hold12  = 진입 후 252거래일(약 12개월) 경과
   에피소드는 겹치지 않는다(청산 다음 날부터 재탐색). 데이터 끝까지 청산되지
   않은 마지막 구간은 통계에서 제외한다(unresolved_excluded).
@@ -53,9 +55,11 @@ WEIGHTS = {
     "equal": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
     "pyramid": [1.0, 1.0, 1.5, 1.5, 2.0, 2.0],
 }
-EXIT_RULES = ["sma", "target", "hold12"]
 TARGET_PCT = 10.0
-HOLD_BARS = 252
+# 보유 기간 청산 규칙: 규칙 이름 → 보유 거래일 수
+HOLD_BARS_MAP = {"hold3": 63, "hold6": 126, "hold12": 252}
+HOLD_BARS_MAX = max(HOLD_BARS_MAP.values())
+EXIT_RULES = ["sma", "target"] + list(HOLD_BARS_MAP)
 # sma·target 규칙의 대기 상한. 상한에 닿으면 그 시점 종가로 강제 청산한다.
 # 상한 없이 '조건 달성까지 대기'로 두면 미달 구간이 통계에서 빠져 승률이
 # 100%에 수렴하는 동어반복이 된다(도달했으니 이겼다). 실패를 포함시키려면
@@ -90,7 +94,7 @@ def load_close(ticker):
         if "Close" not in raw.columns:
             continue
         s = raw["Close"].dropna().sort_index()
-        if len(s) > SMA_LONG + HOLD_BARS:
+        if len(s) > SMA_LONG + min(HOLD_BARS_MAP.values()):
             return s
     return None
 
@@ -135,7 +139,7 @@ def simulate(dates, close, ma_long, ma_mid, ma_short, weights, exit_rule):
                 if exit_rule == "target" and close[j] >= avg * (1 + TARGET_PCT / 100.0):
                     exit_idx, forced = j, False
                     break
-                if exit_rule == "hold12" and (j - start) >= HOLD_BARS:
+                if exit_rule in HOLD_BARS_MAP and (j - start) >= HOLD_BARS_MAP[exit_rule]:
                     exit_idx, forced = j, False
                     break
                 if exit_rule in ("sma", "target") and (j - start) >= MAX_WAIT_BARS:
@@ -190,7 +194,7 @@ def analyze(ticker):
     ma_m = close_s.rolling(SMA_MID).mean()
     ma_s = close_s.rolling(SMA_SHORT).mean()
     valid = ma_l.notna() & ma_m.notna() & ma_s.notna()
-    if valid.sum() < HOLD_BARS + 50:
+    if valid.sum() < min(HOLD_BARS_MAP.values()) + 50:
         return None
 
     dates = close_s.index[valid]        # DatetimeIndex 유지 (뺄셈 결과에 .days 필요)
@@ -271,8 +275,9 @@ def main():
             "exit_rules": {
                 "sma": f"종가가 200일선 위로 복귀 시 청산 (최대 {MAX_WAIT_BARS}거래일 대기 후 강제 청산)",
                 "target": f"평균단가 +{TARGET_PCT:.0f}% 도달 시 청산 (최대 {MAX_WAIT_BARS}거래일 대기 후 강제 청산)",
-                "hold12": f"진입 후 {HOLD_BARS}거래일 경과 시 청산",
+                **{k: f"진입 후 {v}거래일 경과 시 청산" for k, v in HOLD_BARS_MAP.items()},
             },
+            "hold_bars": HOLD_BARS_MAP,
             "max_wait_bars": MAX_WAIT_BARS,
             "episode_policy": "non_overlapping, unresolved_excluded, forced_exit_at_max_wait",
             "period_split": PERIOD_SPLIT,
