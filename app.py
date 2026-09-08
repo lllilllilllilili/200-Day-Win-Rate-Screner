@@ -2853,8 +2853,32 @@ def _accum_realtime(ticker):
     }
 
 
+def _kr_exact(q):
+    """국내 종목명 '완전일치'만 찾는다(대소문자 무시). 부분일치는 일부러 제외.
+
+    부분일치를 허용하면 소문자 미국 티커가 국내 종목으로 오인된다.
+    실측: v → NAVER, t → KT&G, hd → HD현대 후보 6개로 잡혔다.
+    반면 완전일치는 naver·hmm·kt·sk·lg·gs 처럼 실제 국내 종목명일 때만 걸린다.
+    """
+    try:
+        listing = load_krx_listing()
+    except Exception:
+        return None
+    if listing is None or listing.empty or "Name" not in listing.columns:
+        return None
+    hit = listing[listing["Name"].astype(str).str.lower() == q.strip().lower()]
+    if len(hit) != 1:
+        return None
+    r = hit.iloc[0]
+    return str(r["Code"]), str(r["Name"]), str(r.get("Market", ""))
+
+
 def _accum_resolve(query):
-    """입력(티커·종목코드·한글 기업명)을 yfinance 티커로 변환.
+    """입력(티커·종목코드·기업명)을 yfinance 티커로 변환.
+
+    영문 입력은 대문자로 올려 미국 티커로 본다(aapl → AAPL). 단 국내 종목명과
+    완전일치하면 국내 종목을 택한다. 그래도 데이터가 없으면 호출부에서
+    retry_kr 로 국내 부분일치 검색을 한 번 더 시도한다.
 
     반환: {"status": "ok"|"candidates"|"none", ...}
     """
@@ -2865,7 +2889,8 @@ def _accum_resolve(query):
         return {"status": "none"}
     if re.fullmatch(r"\d{6}", q):
         return {"status": "ok", "ticker": _kr_ticker(q), "name": q, "note": None}
-    if _has_korean(q) or not _looks_like_ticker(q):
+
+    if _has_korean(q):
         kind, payload, *rest = (*resolve_korean_name(q), None)
         if kind == "code":
             name = rest[0] if rest else q
@@ -2874,8 +2899,16 @@ def _accum_resolve(query):
         if kind == "candidates":
             return {"status": "candidates", "cands": payload}
         return {"status": "none"}
+
+    ex = _kr_exact(q)
+    if ex:
+        code, name, market = ex
+        return {"status": "ok", "ticker": _kr_ticker(code, market), "name": name,
+                "note": f"'{q}' 는 국내 종목명과 일치해 **{name} ({code})** 로 조회했어요."}
+
     up = q.upper()
-    return {"status": "ok", "ticker": up, "name": up, "note": None}
+    return {"status": "ok", "ticker": up, "name": up, "retry_kr": q,
+            "note": (f"`{q}` → `{up}` 로 대문자 변환했어요." if up != q else None)}
 
 
 def _zone_wr(zones, level, band):
@@ -2990,6 +3023,24 @@ def render_accum_plan():
 
     with st.spinner(f"{tk} 전체 기간을 계산하는 중…"):
         rt = _accum_realtime(tk)
+
+    # 미국 티커로 못 찾았으면 국내 부분일치 검색으로 한 번 더 시도한다.
+    # (posco·kb·nh 처럼 국내 종목명의 앞부분만 입력한 경우)
+    if not rt and res.get("retry_kr"):
+        kind, payload, *rest = (*resolve_korean_name(res["retry_kr"]), None)
+        if kind == "code":
+            tk2 = _kr_ticker(payload)
+            rt2 = _accum_realtime(tk2)
+            if rt2:
+                name2 = rest[0] if rest else payload
+                st.info(f"`{tk}` 로는 데이터를 찾지 못해 국내 종목 "
+                        f"**{name2} ({payload})** 로 조회했어요.")
+                tk, tk_name, rt = tk2, name2, rt2
+        elif kind == "candidates":
+            picks = ", ".join(f"{n}({c})" for c, n, _ in payload[:5])
+            st.warning(f"`{tk}` 로는 데이터가 없어요. 국내 종목 중에는 {picks} 가 있습니다. "
+                       "종목코드로 다시 조회해 보세요.")
+
     if not rt:
         st.error(f"`{tk}` 가격 데이터를 불러오지 못했거나 200일선을 만들 만큼 "
                  "기간이 길지 않아요. 상장 1년 미만이면 계산할 수 없습니다.")
