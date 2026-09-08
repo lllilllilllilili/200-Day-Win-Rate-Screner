@@ -2088,6 +2088,9 @@ def render_pullback_finder():
         return
 
     gen = str(RECOVERY_META.get("generated_at", "미기록"))[:10]
+    _stale = _staleness_note(RECOVERY_META, "복귀·베타·재무")
+    if _stale:
+        st.warning(_stale)
     st.info("📌 **복귀 기간**은 종가가 200일선 아래로 내려간 날부터 다시 위로 올라온 날까지의 "
             "**달력일**이고, 아직 복귀하지 않은 구간은 통계에서 제외했어요.  \n"
             f"📌 **베타**는 최근 {RECOVERY_META.get('beta_years', 3)}년 일간수익률 기준 "
@@ -2752,6 +2755,28 @@ st.title("📈 200일선 투자 도구 모음")
 # ============================================================
 # 추가 도구 7: 적립 계획 만들기 (위치별 승률 × 20/50/200일선)
 # ============================================================
+def _staleness_note(meta, label, warn_days=150):
+    """사전계산 생성일이 오래됐으면 경고 문구를 돌려준다 (없으면 None).
+
+    복귀 사이클·베타는 표본이 100회 이상 누적된 통계라 며칠~몇 주로는 값이 거의
+    바뀌지 않는다(실측: 2일 경과 시 7종목 전부 소수점까지 동일). 다만 재무건전성은
+    분기 실적마다 바뀌므로 한 분기를 넘기면 알려준다.
+    """
+    gen = str(meta.get("generated_at") or "")[:10]
+    if len(gen) != 10:
+        return None
+    try:
+        days = (pd.Timestamp.now(tz="UTC").tz_convert(None) - pd.Timestamp(gen)).days
+    except Exception:
+        return None
+    if days < warn_days:
+        return None
+    return (f"⚠️ {label} 사전계산이 {days}일 전({gen}) 값입니다. 복귀 통계와 베타는 "
+            "표본이 많아 거의 변하지 않지만 **재무건전성은 분기 실적마다 바뀝니다.** "
+            "저장소 Actions 탭에서 '사전계산 갱신'을 수동 실행하거나 로컬에서 "
+            "`python precompute_recovery.py` 를 돌려주세요.")
+
+
 def _norm_zones(z):
     """구간 키를 문자열 정수로 통일. 실시간 계산은 int 키, JSON 로드는 str 키를 준다."""
     out = {}
@@ -3089,6 +3114,9 @@ def _render_accum_scan():
             st.warning("사전계산 데이터(accum_data.json)가 없어요. "
                        "`python precompute_accum.py` 를 실행하면 이 기능을 쓸 수 있습니다.")
             return
+        _stale = _staleness_note(ACCUM_META, "적립 백테스트")
+        if _stale:
+            st.warning(_stale)
 
         rl = {"sma": "200일선 복귀 시 매도", "target": "평균단가 +10% 도달 시 매도",
               "hold1": "1개월 보유", "hold3": "3개월 보유",

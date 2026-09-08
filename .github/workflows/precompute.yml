@@ -1,0 +1,103 @@
+name: 사전계산 갱신
+
+# 복귀 사이클·베타·재무건전성(recovery_data.json)과 적립 백테스트(accum_data.json)를
+# 월 1회 다시 계산해 커밋한다. Streamlit Cloud 가 main 을 보고 있어 커밋되면 자동 반영된다.
+#
+# precompute_winzone.py 는 여기서 돌리지 않는다.
+#   · FinanceDataReader 로 KRX 시총 상위 100을 매번 다시 조회해 국장 종목 구성이 바뀐다
+#   · winzone_data.json 을 읽는 기능이 7곳이고, _market_is_bull 은 승률 60% 경계로
+#     강세장을 판정하므로 값이 조금 흔들리면 다른 탭 결과가 뒤집힐 수 있다
+#   · 그 목록 엔드포인트가 간헐적으로 404 를 낸다
+# 필요할 때 로컬에서 직접 실행하고 diff 를 확인한 뒤 커밋한다.
+
+on:
+  schedule:
+    - cron: "0 18 1 * *"      # 매월 1일 18:00 UTC (KST 익일 03:00)
+  workflow_dispatch:           # 수동 실행
+
+permissions:
+  contents: write
+
+concurrency:
+  group: precompute
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 의존성 설치
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 갱신 전 파일 백업 (검증 비교용)
+        run: |
+          mkdir -p /tmp/before
+          cp recovery_data.json /tmp/before/ 2>/dev/null || echo "recovery_data.json 없음"
+          cp accum_data.json    /tmp/before/ 2>/dev/null || echo "accum_data.json 없음"
+          sha256sum winzone_data.json > /tmp/before/winzone.sha256
+
+      - name: 복귀·베타·재무 재계산
+        run: python precompute_recovery.py
+
+      - name: 적립 백테스트 재계산
+        run: python precompute_accum.py
+
+      - name: winzone_data.json 무변경 확인
+        # 두 스크립트는 유니버스를 winzone_data.json 에서 읽기만 한다.
+        # 혹시라도 바뀌면 종목 구성이 흔들린 것이므로 즉시 실패시킨다.
+        run: |
+          sha256sum -c /tmp/before/winzone.sha256
+          echo "✅ winzone_data.json 변경 없음"
+
+      - name: 산출물 검증 (종목 대량 누락 차단)
+        run: |
+          python validate_precompute.py --kind recovery \
+            --old /tmp/before/recovery_data.json --new recovery_data.json
+          python validate_precompute.py --kind accum \
+            --old /tmp/before/accum_data.json --new accum_data.json
+
+      - name: 변경 있으면 커밋
+        run: |
+          if git diff --quiet -- recovery_data.json accum_data.json; then
+            echo "변경 없음 — 커밋 생략"
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add recovery_data.json accum_data.json
+          git commit -m "사전계산 갱신 (자동)
+
+          precompute_recovery.py / precompute_accum.py 월간 재실행.
+          유니버스는 winzone_data.json 에서 상속하므로 종목 구성은 그대로다.
+          종목 유지율과 필수 키를 validate_precompute.py 로 검증한 뒤 커밋했다."
+          git push
+
+      - name: 요약
+        if: always()
+        run: |
+          {
+            echo "### 사전계산 갱신 결과"
+            echo ""
+            echo '```'
+            python - <<'PY'
+          import json
+          for f in ("recovery_data.json", "accum_data.json"):
+              try:
+                  d = json.load(open(f, encoding="utf-8"))
+                  print(f"{f}: {len(d['data'])}종목 · 생성 {d['meta']['generated_at'][:19]}")
+              except Exception as e:
+                  print(f"{f}: 읽기 실패 {e}")
+          PY
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
