@@ -3135,7 +3135,9 @@ def _render_accum_scan():
                            help="'200일선 아래만'은 -0.3% 처럼 첫 매수 구간에 아직 닿지 않은 "
                                 "종목까지 포함합니다. 지금 살 수 있는 종목만 보려면 첫 구간 도달을 "
                                 "고르세요.")
-        topn = int(c4.number_input("표시 개수", 5, 50, 10, 5, key="as_topn"))
+        # 기본 20위까지. 10위로 자르면 기대수익이 최상위인데 현재 위치가 얕아
+        # 밀린 종목(예: 괴리 -8% 의 TSLA, 13위)이 아예 안 보인다.
+        topn = int(c4.number_input("표시 개수", 5, 50, 20, 5, key="as_topn"))
 
         c5, c6 = st.columns(2)
         min_eps = int(c5.number_input("최소 에피소드", 0, 100, 10, 5, key="as_eps",
