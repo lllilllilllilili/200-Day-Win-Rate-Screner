@@ -19,6 +19,7 @@
           pyramid = 1 : 1 : 1.5 : 1.5 : 2 : 2   (하방증량)
   청산    sma     = 종가가 200일선 위로 복귀한 날
           target  = 종가가 그때까지의 평균단가 +10% 에 닿은 날
+          hold1   = 진입 후 21거래일(약 1개월) 경과
           hold3   = 진입 후 63거래일(약 3개월) 경과
           hold6   = 진입 후 126거래일(약 6개월) 경과
           hold12  = 진입 후 252거래일(약 12개월) 경과
@@ -57,7 +58,7 @@ WEIGHTS = {
 }
 TARGET_PCT = 10.0
 # 보유 기간 청산 규칙: 규칙 이름 → 보유 거래일 수
-HOLD_BARS_MAP = {"hold3": 63, "hold6": 126, "hold12": 252}
+HOLD_BARS_MAP = {"hold1": 21, "hold3": 63, "hold6": 126, "hold12": 252}
 HOLD_BARS_MAX = max(HOLD_BARS_MAP.values())
 EXIT_RULES = ["sma", "target"] + list(HOLD_BARS_MAP)
 # sma·target 규칙의 대기 상한. 상한에 닿으면 그 시점 종가로 강제 청산한다.
