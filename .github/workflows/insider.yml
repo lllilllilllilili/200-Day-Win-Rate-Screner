@@ -1,0 +1,113 @@
+name: 공시 뻐꾸기통 갱신
+
+# 미국 SEC Form 4 내부자 매수와 추적 인물·기관 공시, 한국 DART 임원 매수와
+# 국민연금 대량보유를 매일 수집해 커밋한다. Streamlit Cloud 가 main 을 보고 있어
+# 커밋되면 자동 반영된다.
+#
+# 실행 시각을 04:30 UTC 로 잡은 이유
+#   SEC daily-index 는 해당 영업일 접수가 마감된 뒤 공개된다. 미국 동부 자정 이후에
+#   돌려야 전날 접수분이 온전히 잡힌다. 04:30 UTC = 미 동부 00:30 (EDT 기준).
+#
+# DART_API_KEY 가 없으면 한국 부분만 건너뛰고 미국 결과는 정상 커밋된다.
+#   Settings → Secrets and variables → Actions → New repository secret
+#     이름: DART_API_KEY   값: opendart.fss.or.kr 에서 발급받은 인증키
+
+on:
+  schedule:
+    - cron: "30 4 * * 2-6"     # 화~토 04:30 UTC (미국 월~금 접수분)
+  workflow_dispatch:
+    inputs:
+      days:
+        description: "며칠 전까지 수집할지"
+        required: false
+        default: "3"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: insider
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+
+    env:
+      # SEC 는 User-Agent 에 실제 연락처를 요구한다. 저장소 변수로 바꿔 두면 좋다.
+      SEC_USER_AGENT: ${{ vars.SEC_USER_AGENT || '200sma-screener github-actions noreply@github.com' }}
+      DART_API_KEY: ${{ secrets.DART_API_KEY }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 갱신 전 백업 (검증 비교용)
+        run: |
+          mkdir -p /tmp/before
+          cp insider_data.json /tmp/before/ 2>/dev/null || echo "첫 실행 — 기존 파일 없음"
+
+      - name: 수집
+        run: |
+          DAYS="${{ github.event.inputs.days }}"
+          python precompute_insider.py --days "${DAYS:-3}"
+
+      - name: 산출물 점검
+        # 자동 갱신에서 가장 위험한 실패는 '에러 없이 빈 데이터를 덮어쓰는 것'이다.
+        # 미국 추적 공시가 0건이면 SEC 접근 자체가 막힌 것으로 보고 실패시킨다.
+        run: |
+          python - <<'PY'
+          import json, sys
+          d = json.load(open("insider_data.json", encoding="utf-8"))
+          us = len(d.get("us_insider_buys") or [])
+          wl = len(d.get("us_watchlist") or [])
+          kr = len(d.get("kr_insider_buys") or [])
+          km = len(d.get("kr_major_holdings") or [])
+          print(f"미국 매수 {us} · 추적 {wl} · 한국 매수 {kr} · 대량보유 {km}")
+          print("kr_status:", d.get("meta", {}).get("kr_status"))
+          if wl == 0:
+              sys.exit("추적 공시가 0건입니다 — SEC 접근이 차단됐을 가능성이 큽니다")
+          PY
+
+      - name: 변경 있으면 커밋
+        run: |
+          if git diff --quiet -- insider_data.json; then
+            echo "변경 없음 — 커밋 생략"
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add insider_data.json
+          git commit -m "공시 데이터 갱신 (자동)
+
+          precompute_insider.py 일간 수집. SEC Form 4 공개시장 매수(P)와
+          추적 인물·기관 공시, DART 임원 매수·대량보유를 최근 90일 롤링으로 보관한다."
+          git push
+
+      - name: 요약
+        if: always()
+        run: |
+          {
+            echo "### 공시 수집 결과"
+            echo '```'
+            python - <<'PY'
+          import json
+          try:
+              d = json.load(open("insider_data.json", encoding="utf-8"))
+              m = d.get("meta", {})
+              print("갱신:", m.get("generated_at"))
+              print("한국 상태:", m.get("kr_status"))
+              for k, label in (("us_insider_buys", "미국 내부자 매수"),
+                               ("us_watchlist", "추적 인물·기관"),
+                               ("kr_insider_buys", "한국 내부자 매수"),
+                               ("kr_major_holdings", "한국 대량보유")):
+                  print(f"{label}: {len(d.get(k) or [])}건")
+          except Exception as e:
+              print("읽기 실패:", e)
+          PY
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

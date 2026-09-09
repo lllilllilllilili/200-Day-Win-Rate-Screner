@@ -96,6 +96,17 @@ try:
 except Exception:
     ACCUM_DATA, ACCUM_META = {}, {}
 
+# 공시 뻐꾸기통 (precompute_insider.py 로 생성). 없어도 다른 기능은 그대로 동작한다.
+try:
+    import json as _in_json, os as _in_os
+    _in_path = _in_os.path.join(_in_os.path.dirname(__file__), "insider_data.json")
+    with open(_in_path, encoding="utf-8") as _in_f:
+        _in = _in_json.load(_in_f)
+    INSIDER = _in
+    INSIDER_META = _in.get("meta", {})
+except Exception:
+    INSIDER, INSIDER_META = {}, {}
+
 # ------------------------------------------------------------
 # 즐겨찾기 (URL 쿼리 파라미터에 저장 — 북마크/홈화면 추가로 유지)
 # ------------------------------------------------------------
@@ -3716,6 +3727,242 @@ def render_accum_plan():
         f"'위치별 승률 스크리너' 탭과 같은 종목에서 값이 다를 수 있어요.")
 
 
+# ============================================================
+# 추가 도구 8: 공시 뻐꾸기통 (내부자 매수 · 추적 인물 · 국민연금)
+# ============================================================
+def _money(v, market="US"):
+    if v is None or v != v:
+        return "-"
+    v = float(v)
+    if market == "KR":
+        return f"{v / 1e8:,.1f}억" if abs(v) >= 1e8 else f"{v / 1e4:,.0f}만"
+    if abs(v) >= 1e9:
+        return f"${v / 1e9:,.2f}B"
+    if abs(v) >= 1e6:
+        return f"${v / 1e6:,.2f}M"
+    return f"${v / 1e3:,.0f}K"
+
+
+def _jump_to_plan(label, tickers, key):
+    """공시에서 고른 종목을 적립 계획 탭으로 넘긴다.
+
+    group1(적립 계획)이 group2(이 탭)보다 먼저 렌더되므로, session_state 를
+    바꾸고 rerun 해야 다음 실행에서 입력창에 반영된다.
+    """
+    if not tickers:
+        return
+    c1, c2 = st.columns([2, 1])
+    pick = c1.selectbox(label, tickers, key=f"{key}_pick")
+    if c2.button("📐 적립 계획 보기", key=f"{key}_go"):
+        st.session_state["ap_q"] = pick.split(" ")[0]
+        st.rerun()
+
+
+def render_insider():
+    st.subheader("📰 공시 뻐꾸기통")
+    st.caption("미국 SEC Form 4 내부자 **공개시장 매수**와 추적 인물·기관의 지분 공시, "
+               "한국 DART 임원·주요주주 매수와 국민연금 대량보유를 모아 봅니다.")
+
+    if not INSIDER:
+        st.error("공시 데이터(insider_data.json)가 없어요. "
+                 "`python precompute_insider.py` 를 실행하면 생성됩니다.")
+        return
+
+    stale = _staleness_note(INSIDER_META, "공시", warn_days=7)
+    if stale:
+        st.warning(stale)
+
+    us = INSIDER.get("us_insider_buys") or []
+    kr = INSIDER.get("kr_insider_buys") or []
+    wl = INSIDER.get("us_watchlist") or []
+    kmaj = INSIDER.get("kr_major_holdings") or []
+    gen = str(INSIDER_META.get("generated_at", ""))[:16].replace("T", " ")
+
+    m = st.columns(4)
+    m[0].metric("미국 내부자 매수", f"{len(us)}건")
+    m[1].metric("한국 내부자 매수", f"{len(kr)}건")
+    m[2].metric("추적 인물·기관 공시", f"{len(wl)}건")
+    m[3].metric("국민연금 등 대량보유", f"{len(kmaj)}건")
+    st.caption(f"· 갱신 {gen} UTC · 최근 {INSIDER_META.get('keep_days', 90)}일 보관 · "
+               f"매수 하한 미국 {_money(INSIDER_META.get('min_buy_usd'))} / "
+               f"한국 {_money(INSIDER_META.get('min_buy_krw'), 'KR')}")
+
+    sub = st.tabs(["🔥 오늘의 신호", "🇺🇸 내부자 매수", "🇰🇷 내부자 매수",
+                   "👤 추적 인물·기관", "🏦 국민연금·대량보유"])
+
+    # ---------------- 오늘의 신호 ----------------
+    with sub[0]:
+        if not us:
+            st.info("아직 수집된 미국 내부자 매수가 없어요.")
+        else:
+            top = sorted(us, key=lambda r: -(r.get("score") or 0))[:15]
+            st.markdown("**점수 상위 15건** — 금액·직위·보유증가·클러스터를 합산한 순위입니다.")
+            st.dataframe(pd.DataFrame([{
+                "점수": r.get("score"),
+                "거래일": r.get("trade_date"),
+                "티커": r.get("ticker"),
+                "회사": (r.get("company") or "")[:26],
+                "보고자": (r.get("owner") or "")[:24],
+                "직위": (r.get("title") or "")[:22] or ("이사" if r.get("is_director")
+                                                      else "10%주주" if r.get("is_ten_pct") else "-"),
+                "매수금액": _money(r.get("value")),
+                "클러스터": f"{r.get('cluster_n', 1)}인" if r.get("cluster_n", 1) > 1 else "-",
+                "계획매매": "10b5-1" if r.get("plan_10b5_1") else "-",
+            } for r in top]), use_container_width=True, hide_index=True)
+
+            cl = [r for r in us if (r.get("cluster_n") or 1) >= 2]
+            if cl:
+                names = sorted({r["ticker"] for r in cl})
+                st.success(f"**클러스터 매수 감지** — 같은 종목을 여러 내부자가 "
+                           f"{INSIDER_META.get('cluster_window_days', 30)}일 안에 매수: "
+                           + ", ".join(f"`{t}`" for t in names[:20]))
+                st.caption("여러 임원이 동시에 자기 돈으로 사는 경우가 단일 매수보다 "
+                           "의미 있는 신호로 알려져 있습니다.")
+            _jump_to_plan("이 종목의 적립 계획 보기",
+                          [f"{r['ticker']} — {(r.get('company') or '')[:24]}" for r in top],
+                          "ins_top")
+
+    # ---------------- 미국 내부자 매수 ----------------
+    with sub[1]:
+        if not us:
+            st.info("데이터가 없어요.")
+        else:
+            f1, f2, f3 = st.columns(3)
+            floor = f1.selectbox("최소 매수금액", [100_000, 500_000, 1_000_000, 5_000_000],
+                                 index=0, format_func=lambda v: _money(v), key="ins_us_min")
+            role = f2.selectbox("직위", ["전체", "CEO·CFO", "임원", "이사", "10% 주주"],
+                                index=0, key="ins_us_role")
+            only_cluster = f3.checkbox("클러스터 매수만", value=False, key="ins_us_cl")
+
+            def keep(r):
+                if (r.get("value") or 0) < floor:
+                    return False
+                if only_cluster and (r.get("cluster_n") or 1) < 2:
+                    return False
+                t = (r.get("title") or "").lower()
+                if role == "CEO·CFO":
+                    return any(k in t for k in ("chief executive", "ceo",
+                                                "chief financial", "cfo"))
+                if role == "임원":
+                    return bool(r.get("is_officer"))
+                if role == "이사":
+                    return bool(r.get("is_director"))
+                if role == "10% 주주":
+                    return bool(r.get("is_ten_pct"))
+                return True
+
+            rows = sorted([r for r in us if keep(r)], key=lambda r: -(r.get("score") or 0))
+            st.success(f"조건에 맞는 매수 **{len(rows)}건** (전체 {len(us)}건)")
+            if rows:
+                st.dataframe(pd.DataFrame([{
+                    "점수": r.get("score"), "거래일": r.get("trade_date"),
+                    "접수일": r.get("filed"), "티커": r.get("ticker"),
+                    "회사": (r.get("company") or "")[:24],
+                    "보고자": (r.get("owner") or "")[:24],
+                    "직위": (r.get("title") or "")[:20] or "-",
+                    "주식수": f"{(r.get('shares') or 0):,.0f}",
+                    "단가": f"{(r.get('price') or 0):,.2f}",
+                    "매수금액": _money(r.get("value")),
+                    "체결건수": r.get("trades", 1),
+                    "매수후 보유": (f"{r['shares_after']:,.0f}"
+                                if r.get("shares_after") else "-"),
+                    "클러스터": r.get("cluster_n", 1),
+                    "공시": r.get("url", ""),
+                } for r in rows[:300]]), use_container_width=True, hide_index=True,
+                    column_config={"공시": st.column_config.LinkColumn("공시", display_text="SEC")})
+
+    # ---------------- 한국 내부자 매수 ----------------
+    with sub[2]:
+        status = INSIDER_META.get("kr_status")
+        if status == "no_key":
+            st.warning(
+                "**DART API 키가 없어 한국 데이터를 수집하지 못했습니다.**  \n"
+                "1. https://opendart.fss.or.kr 에서 무료 발급 (가입 후 인증키 신청)  \n"
+                "2. 로컬: `export DART_API_KEY=발급받은키`  \n"
+                "3. 자동 갱신: GitHub 저장소 → Settings → Secrets and variables → Actions → "
+                "`DART_API_KEY` 추가  \n"
+                "키를 넣으면 임원·주요주주 매수와 국민연금 대량보유가 자동으로 채워집니다.")
+        elif not kr:
+            st.info(f"수집은 됐지만 조건에 맞는 건이 없어요. (상태: {status})")
+        if kr:
+            st.dataframe(pd.DataFrame([{
+                "거래일": r.get("trade_date"), "종목코드": r.get("ticker"),
+                "회사": r.get("company"), "보고자": r.get("owner"),
+                "직위": r.get("title") or "-",
+                "증가주식": f"{(r.get('shares') or 0):,.0f}",
+                "단가": f"{(r.get('price') or 0):,.0f}" if r.get("price") else "-",
+                "매수금액": _money(r.get("value"), "KR"),
+                "추적대상": r.get("watch") or "-",
+                "공시": r.get("url", ""),
+            } for r in kr[:300]]), use_container_width=True, hide_index=True,
+                column_config={"공시": st.column_config.LinkColumn("공시", display_text="DART")})
+
+    # ---------------- 추적 인물·기관 ----------------
+    with sub[3]:
+        if not wl:
+            st.info("데이터가 없어요.")
+        else:
+            f13 = [r for r in wl if r.get("delayed")]
+            oth = [r for r in wl if not r.get("delayed")]
+            st.markdown("#### 빠른 공시 (Form 4 · 13D/G)")
+            st.caption("Form 4 는 2영업일, 13D 는 5영업일 내 제출이라 비교적 최신입니다.")
+            if oth:
+                st.dataframe(pd.DataFrame([{
+                    "접수일": r.get("filed"), "대상": r.get("label"),
+                    "구분": {"person": "개인", "fund": "기관"}.get(r.get("kind"), r.get("kind")),
+                    "공시종류": r.get("form"), "공시": r.get("url", ""),
+                } for r in oth[:200]]), use_container_width=True, hide_index=True,
+                    column_config={"공시": st.column_config.LinkColumn("공시", display_text="SEC")})
+            else:
+                st.info("최근 빠른 공시가 없어요.")
+
+            st.markdown("#### 13F 분기 보유 공시")
+            st.warning("**13F 는 분기 종료 후 최대 45일까지 지연 공시입니다.** "
+                       "지금 보유를 뜻하지 않고, 이미 청산했을 수도 있습니다. "
+                       "매수 신호로 쓰지 마세요.")
+            if f13:
+                st.dataframe(pd.DataFrame([{
+                    "접수일": r.get("filed"), "대상": r.get("label"),
+                    "공시종류": r.get("form"), "공시": r.get("url", ""),
+                } for r in f13[:200]]), use_container_width=True, hide_index=True,
+                    column_config={"공시": st.column_config.LinkColumn("공시", display_text="SEC")})
+
+    # ---------------- 국민연금·대량보유 ----------------
+    with sub[4]:
+        if INSIDER_META.get("kr_status") == "no_key":
+            st.warning("DART API 키가 필요합니다. '🇰🇷 내부자 매수' 탭의 안내를 참고하세요.")
+        elif not kmaj:
+            st.info("추적 대상의 대량보유 변동이 없어요. (5% 이상 지분 변동만 공시 대상입니다)")
+        else:
+            st.dataframe(pd.DataFrame([{
+                "접수일": r.get("filed"), "종목코드": r.get("ticker"),
+                "회사": r.get("company"), "보고자": r.get("label") or r.get("reporter"),
+                "구분": {"pension": "연기금", "fund": "운용사",
+                        "foreign": "외국계", "person": "개인"}.get(r.get("kind"), "-"),
+                "지분율": f"{r['ratio']:.2f}%" if r.get("ratio") is not None else "-",
+                "직전": f"{r['ratio_prev']:.2f}%" if r.get("ratio_prev") is not None else "-",
+                "변동": (f"{r['ratio'] - r['ratio_prev']:+.2f}%p"
+                        if r.get("ratio") is not None and r.get("ratio_prev") is not None else "-"),
+                "사유": (r.get("reason") or "")[:20],
+                "공시": r.get("url", ""),
+            } for r in kmaj[:300]]), use_container_width=True, hide_index=True,
+                column_config={"공시": st.column_config.LinkColumn("공시", display_text="DART")})
+
+    with st.expander("⚠️ 읽기 전에 알아야 할 것", expanded=False):
+        notes = INSIDER_META.get("notes") or []
+        st.markdown("\n".join(f"- {n}" for n in notes) + """
+- **점수 배점**: 금액 35 · 직위 25 · 보유증가 20 · 클러스터 20. 금액은 로그 스케일이라
+  하한(10만 달러) 대비 100배면 만점입니다.
+- **매도는 담지 않았습니다.** 내부자 매도는 대부분 10b5-1 사전계획이나 세금 납부라
+  정보량이 낮습니다. 필요하면 별도로 추가할 수 있습니다.
+- **한국 임원 매수는 지분율 변동 보고 기반**이라 미국 Form 4 만큼 거래 단가가
+  정확하지 않을 수 있습니다.
+- 내부자 매수가 상승을 보장하지 않습니다. 통계적으로 초과수익이 보고되지만 편차가 큽니다.
+        """)
+    st.caption("· 출처: SEC EDGAR (미국) · DART OpenAPI (한국). 서드파티 스크래핑 없이 "
+               "공식 원본만 사용합니다.")
+
+
 # --- 사이드바: 리소스 관리 ---
 with st.sidebar:
     st.markdown("### ⚙️ 설정")
@@ -3742,7 +3989,8 @@ with group1:
         render_crypto_screener()
 
 with group2:
-    sub = st.tabs(["📋 데일리 스캐너", "🎯 승률 포착기", "🎯 복귀 빠른 눌림목", "🌡️ 시장 붕괴 경고"])
+    sub = st.tabs(["📋 데일리 스캐너", "🎯 승률 포착기", "🎯 복귀 빠른 눌림목",
+                   "🌡️ 시장 붕괴 경고", "📰 공시 뻐꾸기통"])
     with sub[0]:
         render_daily_screener()
     with sub[1]:
@@ -3751,6 +3999,8 @@ with group2:
         render_pullback_finder()
     with sub[3]:
         render_crash_scanner()
+    with sub[4]:
+        render_insider()
 
 with group3:
     sub = st.tabs(["🍼 아기티큐 TQQQ 전략"])
