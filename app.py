@@ -3963,6 +3963,751 @@ def render_insider():
                "공식 원본만 사용합니다.")
 
 
+# ============================================================
+# 추가 도구 9: 돌파 계획 (200일선 상향 돌파 + 피라미딩 + 손절)
+# ============================================================
+# 적립 계획과 방향이 정반대인 전략이라 탭을 나눴다.
+#   적립: 내려갈수록 추가 → 평단 하락 → 손절 없음
+#   돌파: 올라갈수록 추가 → 평단 상승 → 손절 필수
+# 한 화면에 섞으면 '손절 없음'과 '손절 필수'를 혼동한다.
+#
+# 사전계산 JSON 을 쓰지 않는다. 실측 결과 배치 다운로드로 220종목 전체 기간이
+# 13초, 돌파 백테스트가 2.5초라 실시간으로 충분하다. 순차로 받으면 3.3분이지만
+# 티커를 한 번에 묶어 보내면 15배 빨라진다. 병목은 계산이 아니라 다운로드였다.
+
+_BO_MIN_TRADES = 10          # 이보다 표본이 적으면 통계로 보지 않는다
+_BO_STOCK_MARKETS = ("US", "KR")
+_BO_WEIGHTS = (50.0, 30.0, 20.0)      # 역피라미드: 초기에 크게
+_BO_TRIGGERS = (0.0, 7.0, 15.0)       # 진입가 대비 추가매수 시점(%)
+_BO_MKT_EMOJI = {"US": "🇺🇸", "KR": "🇰🇷", "ALT": "🪙", "FXB": "💱", "IDX": "📊"}
+
+
+def _bo_cols(raw, field):
+    """yf.download 결과에서 한 필드를 꺼낸다. 단일/다중 티커 모두 대응."""
+    if raw is None or len(raw) == 0:
+        return None
+    if isinstance(raw.columns, pd.MultiIndex):
+        if field not in raw.columns.get_level_values(0):
+            return None
+        return raw[field]
+    return raw[[field]] if field in raw.columns else None
+
+
+@st.cache_data(ttl=1800, show_spinner=False, max_entries=6)
+def _bo_download(tickers: tuple, period: str):
+    """배치 다운로드. 종가·거래량을 종목별 Series 딕셔너리로 정리해 돌려준다.
+
+    ⚠️ 배치 결과에 rolling() 을 그대로 걸면 안 된다.
+    한국·미국·코인의 거래일이 달라 정렬 과정에서 NaN 이 섞이는데, 그 상태로
+    close.rolling(200).mean() 을 하면 220종목 중 9종목만 값이 나온다.
+    에러 없이 종목이 조용히 사라지는 형태라 눈치채기 어렵다.
+    반드시 컬럼별로 dropna() 한 뒤 계산해야 220/220 이 나온다.
+    """
+    import yfinance as _yf
+    try:
+        raw = _yf.download(list(tickers), period=period, auto_adjust=True,
+                           progress=False, threads=True)
+    except Exception:
+        return {}, {}
+    close, vol = _bo_cols(raw, "Close"), _bo_cols(raw, "Volume")
+    if close is None:
+        return {}, {}
+    if len(tickers) == 1 and list(close.columns) != list(tickers):
+        close.columns = list(tickers)
+        if vol is not None:
+            vol.columns = list(tickers)
+    out_c, out_v = {}, {}
+    for tk in close.columns:
+        s = close[tk].dropna()          # ← 여기가 핵심
+        if len(s) < 220:
+            continue
+        out_c[tk] = s
+        if vol is not None and tk in vol.columns:
+            out_v[tk] = vol[tk].dropna()
+    return out_c, out_v
+
+
+def _bo_backtest(close_vals, buffer):
+    """돌파 진입 → 200일선 -buffer% 이탈 청산. 과거 전 구간 집계.
+
+    손익비는 중앙값으로 낸다. 평균으로 내면 극단적 승리 한 번이 지배해
+    지표가 망가진다 (실측: DOGE 평균기반 108.9배 vs 중앙기반 5.2배,
+    평균익절 +1193.5% vs 중앙익절 +53.3%).
+    """
+    c = np.asarray(close_vals, dtype=float)
+    if len(c) < 250:
+        return None
+    sma = pd.Series(c).rolling(200).mean().values
+    trades, in_pos, ep, ei = [], False, 0.0, 0
+    for i in range(2, len(c)):
+        if np.isnan(sma[i]):
+            continue
+        if in_pos:
+            if c[i] < sma[i] * (1 - buffer):
+                trades.append(((c[i] - ep) / ep * 100.0, i - ei))
+                in_pos = False
+        elif not np.isnan(sma[i - 1]) and c[i - 1] < sma[i - 1] and c[i] > sma[i]:
+            ep, ei, in_pos = c[i], i, True
+    if not trades:
+        return None
+    r = np.array([t[0] for t in trades], dtype=float)
+    w = r > 0
+    win_med = float(np.median(r[w])) if w.any() else 0.0
+    loss_med = float(np.median(r[~w])) if (~w).any() else 0.0
+    total = float(r.sum())
+    # 큰 승리 몇 번에 얼마나 의존하는지. 100% 를 넘으면 상위 3건을 빼면 손실이다.
+    top3 = float(np.sort(r)[::-1][:3].sum())
+    return {
+        "n": len(trades),
+        "win": float(w.mean() * 100.0),
+        "win_med": win_med,
+        "loss_med": loss_med,
+        "loss_worst": float(r.min()),
+        "pf": (win_med / abs(loss_med)) if loss_med else None,
+        "ret_med": float(np.median(r)),
+        "ret_avg": float(r.mean()),
+        "total": total,
+        "top3_share": (top3 / total * 100.0) if total else None,
+        "hold_med": float(np.median([t[1] for t in trades])),
+    }
+
+
+def _bo_suspect(bt, buffer):
+    """수정종가 이상 의심 판정.
+
+    완충 buffer 로 청산하는데 중앙 손절이 그보다 10%p 이상 나쁘면 데이터가
+    깨진 것으로 본다. 실측: LG유플러스는 완충 5% 인데 중앙손절 -15.4%,
+    최악 -75.0%, 일변동 최대 283.5%(2002-01-02) 였다. 삼성전자는 -6.8% 로 정상.
+    사전계산에는 validate_precompute.py 게이트가 있었지만 실시간은 없으므로
+    여기서 직접 걸러야 한다.
+    """
+    if not bt:
+        return False
+    return bt["loss_med"] < -(buffer * 100.0 + 10.0)
+
+
+def _bo_share_txt(bt):
+    """상위 3건 의존도 표시. 100% 초과면 경고 표시를 붙인다.
+
+    합산이 음수면 비율 자체가 해석 불가라 숨긴다 (실측: LG유플러스 합산 -1577%
+    에 상위3건 -10% 라는 값이 나왔다).
+    """
+    share = (bt or {}).get("top3_share")
+    if share is None or not bt.get("total") or bt["total"] <= 0:
+        return "-"
+    return f"{share:.0f}%" + (" ⚠️" if share > 100 else "")
+
+
+def _bo_kelly(win_pct, payoff):
+    """켈리 비율과 권장 시도 횟수.
+
+    승률 28% · 손익비 7배 같은 비대칭 전략에서 '한 번에 얼마를 걸까'는
+    감이 아니라 계산으로 답이 나온다. f = (p·b - q) / b.
+    통계 오차를 감안해 실전에서는 절반(하프켈리)을 쓴다.
+    """
+    if not payoff or payoff <= 0 or win_pct is None:
+        return None
+    p = max(0.0, min(1.0, win_pct / 100.0))
+    q = 1.0 - p
+    f = (p * payoff - q) / payoff
+    if f <= 0:
+        return {"full": f, "half": 0.0, "attempts": None}
+    half = f / 2.0
+    return {"full": f, "half": half, "attempts": int(round(1.0 / half)) if half > 0 else None}
+
+
+@st.cache_data(ttl=1800, show_spinner=False, max_entries=12)
+def _bo_scan(recent_days: int, buffer: float, min_trades: int):
+    """2단계 스캔. 전체를 백테스트하지 않고 후보만 좁혀서 받는다.
+
+    1단계: 220종목 2년치 배치로 '최근 N거래일 안에 돌파하고 지금도 200일선 위'
+    2단계: 걸린 종목만 전체 기간을 받아 과거 돌파 통계
+
+    실측 9.2초 (1단계 7.2초 + 2단계 2.0초). 전부 백테스트하면 15.5초.
+    """
+    uni = WINZONE_DATA or {}
+    if not uni:
+        return [], {}
+    tks = tuple(sorted(uni.keys()))
+    close, vol = _bo_download(tks, "2y")
+    if not close:
+        return [], {"error": "가격 데이터를 받지 못했어요."}
+
+    cands = []
+    for tk, s in close.items():
+        c = s.values.astype(float)
+        sma = pd.Series(c).rolling(200).mean().values
+        ma20 = pd.Series(c).rolling(20).mean().values
+        if np.isnan(sma[-1]) or c[-1] <= sma[-1]:
+            continue                       # 지금 200일선 아래면 후보가 아니다
+        cross = None
+        for i in range(len(c) - 1, max(1, len(c) - recent_days - 1), -1):
+            if np.isnan(sma[i - 1]):
+                break
+            if c[i - 1] < sma[i - 1] and c[i] > sma[i]:
+                cross = i
+                break
+        if cross is None:
+            continue
+        seg = c[cross:]
+        high_since = float(seg.max())
+        vr = None
+        v = vol.get(tk)
+        if v is not None and len(v) > cross >= 20:
+            base = float(v.iloc[cross - 20:cross].mean())
+            if base > 0:
+                vr = float(v.iloc[cross] / base)
+        stop = sma[-1] * (1 - buffer)
+        cands.append({
+            "ticker": tk,
+            "name": uni[tk].get("name", tk),
+            "market": uni[tk].get("market"),
+            "price": float(c[-1]),
+            "ma200": float(sma[-1]),
+            "stop": float(stop),
+            "gap": float(c[-1] / sma[-1] - 1) * 100.0,
+            "days_since": int(len(c) - 1 - cross),
+            "entry": float(c[cross]),
+            "since_ret": float(c[-1] / c[cross] - 1) * 100.0,
+            "from_high": float(c[-1] / high_since - 1) * 100.0 if high_since else 0.0,
+            "above_ma20": bool(not np.isnan(ma20[-1]) and c[-1] > ma20[-1]),
+            "vol_ratio": vr,
+            "risk": float(c[-1] / stop - 1) * 100.0,
+            "asof": str(s.index[-1])[:10],
+        })
+    if not cands:
+        return [], {"scanned": len(close), "candidates": 0}
+
+    hist, _ = _bo_download(tuple(sorted(c["ticker"] for c in cands)), "max")
+    excluded = []
+    for cd in cands:
+        s = hist.get(cd["ticker"])
+        bt = _bo_backtest(s.values, buffer) if s is not None else None
+        cd["bt"] = bt
+        if not bt:
+            cd["skip"] = "가격 이력 부족"
+        elif _bo_suspect(bt, buffer):
+            cd["skip"] = (f"수정종가 의심 (중앙손절 {bt['loss_med']:+.1f}%, "
+                          f"최악 {bt['loss_worst']:+.1f}%)")
+        elif bt["n"] < min_trades:
+            cd["skip"] = f"표본 {bt['n']}회 ({min_trades}회 미만)"
+        else:
+            cd["skip"] = None
+        if cd["skip"]:
+            excluded.append({"name": cd["name"], "market": cd["market"],
+                             "reason": cd["skip"]})
+    meta = {"scanned": len(close), "candidates": len(cands),
+            "excluded": excluded, "asof": cands[0]["asof"]}
+    return cands, meta
+
+
+def _bo_rank(pool, recent_days):
+    """후보군 내 백분위(과거 통계) + 절대 기준(현재 상태)으로 100점.
+
+    과거 통계 45 · 현재 상태 40 · 표본 신뢰 15.
+
+    현재 상태를 절대 기준으로 두는 이유: '손절까지 몇 % 인가'는 후보군과
+    무관한 실제 리스크다. 코인이 이 항목에서 낮게 나오는 건 벌점이 아니라
+    사실이다(200일선에서 멀어진 상태로 사는 게 실제로 더 위험하다).
+
+    백분위는 필터를 통과한 후보군 안에서만 계산한다. 코인을 포함/제외하면
+    기준선이 함께 움직이므로, 코인이 구조적으로 1위를 먹는 문제가 사라진다.
+    """
+    if not pool:
+        return []
+
+    def pctl(vals):
+        a = np.asarray(vals, dtype=float)
+        return np.array([float((a <= x).mean()) for x in a])
+
+    p_pf = pctl([min(c["bt"]["pf"] or 0.0, 15.0) for c in pool])
+    p_tot = pctl([c["bt"]["total"] for c in pool])
+    p_win = pctl([c["bt"]["win"] for c in pool])
+
+    for i, c in enumerate(pool):
+        bt = c["bt"]
+        fresh = max(0.0, 1.0 - c["days_since"] / max(1, recent_days))
+        risk_s = max(0.0, min(1.0, (20.0 - c["risk"]) / 20.0))
+        # 돌파 후 힘: 고점 대비 되돌림이 얕고 20일선 위면 살아 있다.
+        pull = max(0.0, min(1.0, (10.0 + c["from_high"]) / 10.0))
+        force = 0.7 * pull + 0.3 * (1.0 if c["above_ma20"] else 0.0)
+        parts = {
+            "과거손익비": 20.0 * p_pf[i],
+            "과거합산": 15.0 * p_tot[i],
+            "과거승률": 10.0 * p_win[i],
+            "표본신뢰": 15.0 * min(1.0, bt["n"] / 30.0),
+            "돌파신선도": 15.0 * fresh,
+            "손절근접": 15.0 * risk_s,
+            "돌파후힘": 10.0 * force,
+        }
+        c["score"] = round(sum(parts.values()), 1)
+        c["parts"] = parts
+    pool.sort(key=lambda x: -x["score"])
+    return pool
+
+
+def _bo_levels(price, stop, budget, triggers=_BO_TRIGGERS, weights=_BO_WEIGHTS):
+    """피라미딩 계획. 올라갈수록 추가하되 비중은 줄인다(역피라미드).
+
+    초기에 크게 넣어야 손절선이 진입가에 가까울 때 손실이 작고,
+    위로 갈수록 작게 넣어야 평단이 덜 올라간다.
+    """
+    rows, cum_w, cum_cost = [], 0.0, 0.0
+    for trig, w in zip(triggers, weights):
+        buy = price * (1 + trig / 100.0)
+        cum_w += w
+        cum_cost += buy * w
+        avg = cum_cost / cum_w
+        rows.append({
+            "trigger": trig,
+            "buy": buy,
+            "weight": w,
+            "cum_weight": cum_w,
+            "alloc": budget * w / 100.0 if budget else None,
+            "avg": avg,
+            "stop": stop,
+            "loss_pct": (stop / avg - 1) * 100.0,
+            "loss_amt": (budget * cum_w / 100.0) * (stop / avg - 1) if budget else None,
+        })
+    return rows
+
+
+@st.cache_data(ttl=1800, show_spinner=False, max_entries=40)
+def _bo_single(ticker: str, buffer: float):
+    """단일 종목 돌파 분석. 실측 0.9초라 사전계산이 필요 없다."""
+    close, vol = _bo_download((ticker,), "max")
+    s = close.get(ticker)
+    if s is None or len(s) < 250:
+        return None
+    c = s.values.astype(float)
+    sma = pd.Series(c).rolling(200).mean().values
+    ma20 = pd.Series(c).rolling(20).mean().values
+    ma50 = pd.Series(c).rolling(50).mean().values
+    if np.isnan(sma[-1]):
+        return None
+    above = bool(c[-1] > sma[-1])
+    cross, scan_n = None, min(len(c) - 2, 250)
+    for i in range(len(c) - 1, len(c) - 1 - scan_n, -1):
+        if i < 1 or np.isnan(sma[i - 1]):
+            break
+        if c[i - 1] < sma[i - 1] and c[i] > sma[i]:
+            cross = i
+            break
+    seg = c[cross:] if cross is not None else None
+    high_since = float(seg.max()) if seg is not None and len(seg) else None
+    stop = float(sma[-1] * (1 - buffer))
+    return {
+        "ticker": ticker,
+        "price": float(c[-1]),
+        "ma200": float(sma[-1]),
+        "ma50": float(ma50[-1]) if not np.isnan(ma50[-1]) else None,
+        "ma20": float(ma20[-1]) if not np.isnan(ma20[-1]) else None,
+        "gap": float(c[-1] / sma[-1] - 1) * 100.0,
+        "above": above,
+        "stop": stop,
+        "risk": float(c[-1] / stop - 1) * 100.0,
+        "days_since": int(len(c) - 1 - cross) if cross is not None else None,
+        "entry": float(c[cross]) if cross is not None else None,
+        "since_ret": float(c[-1] / c[cross] - 1) * 100.0 if cross is not None else None,
+        "from_high": (float(c[-1] / high_since - 1) * 100.0
+                      if high_since else None),
+        "bt": _bo_backtest(c, buffer),
+        "asof": str(s.index[-1])[:10],
+        "history_start": str(s.index[0])[:10],
+    }
+
+
+def _bo_render_scan(recent_days, buffer, min_trades):
+    """돌파 종목 찾기 (순위표)."""
+    with st.expander("🔍 돌파 종목 찾기 — 지금 살 만한 돌파 순위", expanded=False):
+        if not WINZONE_DATA:
+            st.warning("종목 목록(winzone_data.json)이 없어 스캔할 수 없어요.")
+            return
+        c1, c2 = st.columns(2)
+        include_coin = c1.checkbox(
+            "코인·환율·지수 포함", value=False, key="bo_coin",
+            help="코인은 변동성이 커서 200일선에서 멀어진 상태로 사게 됩니다. "
+                 "손절까지 거리가 멀어 리스크가 큽니다. 기본은 주식만 봅니다.")
+        topn = int(c2.number_input("표시 개수", 5, 50, 15, 5, key="bo_topn"))
+
+        if st.button("🔍 돌파 스캔", type="primary", key="bo_go"):
+            with st.spinner(f"{len(WINZONE_DATA)}종목 배치 조회 중… (보통 10초 내외)"):
+                cands, meta = _bo_scan(recent_days, buffer, min_trades)
+            st.session_state["bo_rows"] = cands
+            st.session_state["bo_meta"] = meta
+
+        cands = st.session_state.get("bo_rows")
+        meta = st.session_state.get("bo_meta") or {}
+        if cands is None:
+            st.caption(f"· 대상 {len(WINZONE_DATA)}종목. 배치로 한 번에 받아 "
+                       "10초 내외로 끝납니다. 사전계산 없이 매번 최신 가격으로 계산해요.")
+            return
+        if meta.get("error"):
+            st.error(meta["error"])
+            return
+        if not cands:
+            st.info(f"최근 {recent_days}거래일 안에 200일선을 상향 돌파하고 지금도 "
+                    "위에 있는 종목이 없어요. 기간을 늘려보세요.")
+            return
+
+        pool = [dict(c) for c in cands
+                if not c.get("skip")
+                and (include_coin or c.get("market") in _BO_STOCK_MARKETS)]
+        if not pool:
+            st.warning("조건을 통과한 종목이 없어요. 최소 표본을 낮추거나 "
+                       "코인 포함을 켜보세요.")
+        else:
+            pool = _bo_rank(pool, recent_days)
+            st.success(f"🚀 후보 {meta.get('candidates', 0)}종목 중 조건 통과 "
+                       f"**{len(pool)}종목** · 상위 {min(topn, len(pool))}개 "
+                       f"(기준일 {meta.get('asof', '-')})")
+            st.dataframe(pd.DataFrame([{
+                "순위": i + 1,
+                "점수": r["score"],
+                "등급": _score_grade(r["score"], r["bt"]["n"] < 20),
+                "종목": f"{_BO_MKT_EMOJI.get(r['market'], '')} {r['name']}",
+                "티커": r["ticker"],
+                "돌파 경과": f"{r['days_since']}일",
+                "돌파 후": f"{r['since_ret']:+.1f}%",
+                "고점 대비": f"{r['from_high']:+.1f}%",
+                "20일선": "✓" if r["above_ma20"] else "✗",
+                "손절까지": f"-{r['risk']:.1f}%",
+                "돌파일 거래량": ("-" if r["vol_ratio"] is None
+                              else f"{r['vol_ratio']:.1f}배"),
+                "과거 승률": f"{r['bt']['win']:.0f}%",
+                "손익비": ("-" if r["bt"]["pf"] is None else f"{r['bt']['pf']:.1f}배"),
+                "중앙 수익": f"{r['bt']['ret_med']:+.1f}%",
+                "합산": f"{r['bt']['total']:+.0f}%",
+                # 100% 를 넘으면 상위 3건을 빼면 나머지 합계가 손실이라는 뜻이다.
+                "상위3건 의존": _bo_share_txt(r["bt"]),
+                "표본": f"{r['bt']['n']}회" + (" ⚠️" if r["bt"]["n"] < 20 else ""),
+            } for i, r in enumerate(pool[:topn])]),
+                use_container_width=True, hide_index=True)
+
+            top = pool[0]
+            bd = " · ".join(f"{k} {v:.1f}" for k, v in top["parts"].items())
+            top_pf = top["bt"]["pf"]
+            pf_txt = "-" if top_pf is None else f"{top_pf:.1f}배"
+            st.markdown(
+                f"**1위**: {_BO_MKT_EMOJI.get(top['market'], '')} **{top['name']}** "
+                f"(`{top['ticker']}`) — {top['score']}점  \n"
+                f"{top['days_since']}일 전 돌파 · 지금 사면 손절까지 "
+                f"**-{top['risk']:.1f}%** · 과거 승률 {top['bt']['win']:.0f}% · "
+                f"손익비 {pf_txt}  \n"
+                f"<span style='color:gray'>점수 구성: {bd}</span>",
+                unsafe_allow_html=True)
+
+            p1, p2 = st.columns([2, 1])
+            pick = p1.selectbox("이 중에서 상세 계획 보기",
+                                [f"{r['name']} ({r['ticker']})" for r in pool[:topn]],
+                                key="bo_pick")
+            if p2.button("🚀 이 종목으로 계획 만들기", key="bo_apply"):
+                st.session_state["bo_q"] = pick[pick.rfind("(") + 1:-1]
+                st.rerun()
+
+        ex = meta.get("excluded") or []
+        if ex:
+            with st.expander(f"제외된 {len(ex)}종목과 이유", expanded=False):
+                st.dataframe(pd.DataFrame([{
+                    "종목": f"{_BO_MKT_EMOJI.get(e['market'], '')} {e['name']}",
+                    "제외 이유": e["reason"],
+                } for e in ex]), use_container_width=True, hide_index=True)
+
+        with st.expander("🧮 점수는 어떻게 계산되나 (총 100점)", expanded=False):
+            st.markdown(f"""
+| 항목 | 배점 | 기준 |
+|---|---|---|
+| 과거 손익비 | 20 | **중앙값** 기반 손익비의 후보군 내 백분위 |
+| 과거 합산수익 | 15 | 전체 기간 합산수익의 백분위 |
+| 과거 승률 | 10 | 승률의 백분위 |
+| 표본 신뢰 | 15 | 돌파 30회면 만점 |
+| 돌파 신선도 | 15 | 돌파 직후면 만점, {recent_days}일 지나면 0 |
+| 손절 근접 | 15 | 손절까지 0%면 만점, −20%면 0 |
+| 돌파 후 힘 | 10 | 고점 대비 되돌림이 얕고(70%) 20일선 위면(30%) 만점 |
+
+- **손익비를 중앙값으로 냅니다.** 평균으로 내면 극단적 승리 한 번이 지배해
+  지표가 망가집니다. DOGE 는 평균 기반 108.9배인데 중앙 기반은 5.2배예요
+  (평균익절 +1193.5% vs 중앙익절 +53.3%).
+- **과거 통계는 백분위, 현재 상태는 절대 기준**입니다. '손절까지 몇 %'는
+  후보군과 무관한 실제 리스크라서요. 코인이 이 항목에서 낮게 나오는 건
+  벌점이 아니라 사실입니다.
+- **백분위는 필터를 통과한 후보군 안에서만** 계산합니다. 코인 포함/제외에
+  따라 기준선이 함께 움직여요.
+- **표본 {_BO_MIN_TRADES}회 미만은 제외**합니다. 표본 7회에 손익비 41배 같은
+  값은 전략이 아니라 우연입니다.
+- 등급에 ⚠️ 가 붙으면 돌파 20회 미만으로 표본이 얇다는 뜻입니다.
+            """)
+
+
+def render_breakout():
+    st.subheader("🚀 돌파 계획 만들기")
+    st.caption("200일선을 **상향 돌파**한 종목을 찾아, 올라갈수록 추가 매수하는 "
+               "피라미딩 계획을 만듭니다. 적립 계획과 방향이 반대이고 **손절이 필수**입니다.")
+
+    st.info("**적립 계획과 규칙이 정반대입니다.**  \n"
+            "· 적립: 내려갈수록 추가 → 평단 하락 → **손절 없음**  \n"
+            "· 돌파: 올라갈수록 추가 → 평단 상승 → **손절 필수**  \n"
+            "돌파는 10번 중 3번만 맞고 맞을 때 크게 먹는 전략이라, 손절을 안 하면 "
+            "구조가 무너집니다.")
+
+    c1, c2, c3 = st.columns(3)
+    buffer_pct = c1.selectbox(
+        "손절 완충 (200일선 아래 몇 %)", [0.0, 3.0, 5.0], index=2, key="bo_buf",
+        format_func=lambda v: f"{v:.0f}%",
+        help="완충은 승률과 거래 횟수를 바꾸지만 총수익은 거의 안 바꿉니다. "
+             "42종목 실측: 0% → 승률 15.5%·64회, 5% → 승률 27.8%·21회인데 "
+             "합산수익 중앙값은 +172% vs +165% 로 비슷했어요. "
+             "가짜 돌파를 얼마나 참을지의 선택입니다.")
+    recent_days = int(c2.selectbox("돌파 경과 허용", [10, 20, 40, 60], index=1,
+                                   key="bo_recent",
+                                   format_func=lambda v: f"최근 {v}거래일"))
+    min_trades = int(c3.number_input("최소 표본(돌파 횟수)", 0, 100, _BO_MIN_TRADES, 5,
+                                     key="bo_min"))
+    buffer = buffer_pct / 100.0
+
+    # 스캔을 위에 둬야 '이 종목으로 계획 만들기' 가 session_state 를 채운 뒤
+    # rerun 으로 아래 입력창에 반영된다 (적립 계획과 같은 패턴).
+    _bo_render_scan(recent_days, buffer, min_trades)
+
+    d1, d2 = st.columns([2, 1])
+    with d1:
+        st.session_state.setdefault("bo_q", "AAPL")
+        query = st.text_input("종목 티커 / 종목코드 / 기업명",
+                              placeholder="예: AAPL, TQQQ, 005930, 삼성전자",
+                              key="bo_q")
+    with d2:
+        budget = st.number_input("총 투입 예산", min_value=0.0, value=1000.0, step=100.0,
+                                 key="bo_bud",
+                                 help="단위는 자유롭게 쓰세요(만원·달러 등).")
+
+    if not st.button("🚀 계획 만들기", type="primary", key="bo_plan"):
+        st.info("종목을 입력하고 버튼을 누르세요. 사전계산 목록에 없는 종목도 조회됩니다. "
+                "(전체 기간을 실시간 계산하며 보통 1초)")
+        return
+
+    res = _accum_resolve(query)
+    if res["status"] == "candidates":
+        cands = res["cands"]
+        st.warning(f"'{query}' 와 일치하는 종목이 여러 개예요. 하나를 골라 다시 눌러주세요.")
+        options = [f"{name} ({code}) · {market}" for code, name, market in cands]
+        chosen = st.selectbox("종목 선택", options, key="bo_cand")
+        code, name, market = cands[options.index(chosen)]
+        tk, tk_name = _kr_ticker(code, market), name
+    elif res["status"] == "ok":
+        tk, tk_name = res["ticker"], res["name"]
+        if res.get("note"):
+            st.caption(res["note"])
+    else:
+        st.error(f"'{query}' 로 종목을 찾지 못했어요. 티커나 6자리 종목코드로 시도해 보세요.")
+        return
+
+    with st.spinner(f"{tk} 전체 기간을 계산하는 중…"):
+        r = _bo_single(tk, buffer)
+    if not r and res.get("retry_kr"):
+        kind, payload, *rest = (*resolve_korean_name(res["retry_kr"]), None)
+        if kind == "code":
+            tk2 = _kr_ticker(payload)
+            r2 = _bo_single(tk2, buffer)
+            if r2:
+                tk, tk_name, r = tk2, (rest[0] if rest else payload), r2
+                st.info(f"`{res['ticker']}` 로는 데이터가 없어 국내 종목 "
+                        f"**{tk_name} ({payload})** 로 조회했어요.")
+    if not r:
+        st.error(f"`{tk}` 가격 데이터를 불러오지 못했거나 200일선을 만들 만큼 "
+                 "기간이 길지 않아요. 상장 1년 미만이면 계산할 수 없습니다.")
+        return
+
+    bt = r["bt"]
+    st.caption(f"조회 종목: **{tk_name}** (`{tk}`) · 데이터 {r['history_start']} ~ "
+               f"{r['asof']} · 실시간 계산")
+
+    # ---------------- 현재 상태 ----------------
+    st.markdown("#### 📍 현재 위치")
+    m = st.columns(4)
+    m[0].metric("현재가", f"{r['price']:,.2f}", f"{r['gap']:+.1f}% (200선 대비)")
+    m[1].metric("200일선", f"{r['ma200']:,.2f}")
+    # risk 는 손절선 대비 현재가 위치(%). 200일선 아래면 음수가 되므로
+    # "-{risk}" 처럼 부호를 덧붙이면 '--35.3%' 가 된다. 부호를 그대로 쓴다.
+    if r["above"]:
+        m[2].metric("손절선", f"{r['stop']:,.2f}",
+                    f"-{r['risk']:.1f}% (지금 사면)", delta_color="off")
+    else:
+        m[2].metric("손절선", f"{r['stop']:,.2f}",
+                    "현재가보다 위 — 진입 불가", delta_color="off")
+    if r["days_since"] is not None:
+        m[3].metric("돌파 경과", f"{r['days_since']}일",
+                    f"돌파 후 {r['since_ret']:+.1f}%", delta_color="off")
+    else:
+        m[3].metric("돌파 경과", "-", "최근 1년 내 돌파 없음", delta_color="off")
+
+    # 200일선 아래면 돌파 전략 자체가 성립하지 않는다. 손절선이 현재가보다 위라
+    # '지금 사면 즉시 손절' 상태이므로 계획을 그리지 않고 멈춘다.
+    if not r["above"]:
+        st.warning(f"**아직 200일선 아래입니다** ({r['gap']:+.1f}%). 돌파 전략은 "
+                   f"종가가 200일선 위로 올라온 뒤에 시작합니다. 돌파 가격은 "
+                   f"**{r['ma200']:,.2f}** 이고, 지금 가격에서 "
+                   f"{(r['ma200'] / r['price'] - 1) * 100:+.1f}% 올라야 합니다.  \n"
+                   f"손절선({r['stop']:,.2f})이 현재가보다 위에 있어서 지금 사면 "
+                   f"진입과 동시에 손절 조건입니다. 그래서 계획을 만들지 않았어요.  \n"
+                   f"200일선 아래에서 모으는 계획은 **📐 적립 계획** 탭을 쓰세요.")
+        if bt:
+            with st.expander(f"참고: 이 종목의 과거 돌파 통계 (돌파 {bt['n']}회)",
+                             expanded=False):
+                st.markdown(
+                    f"- 승률 **{bt['win']:.0f}%** · 중앙 수익 **{bt['ret_med']:+.1f}%** "
+                    f"· 합산 **{bt['total']:+.0f}%**\n"
+                    f"- 중앙 익절 {bt['win_med']:+.1f}% / 중앙 손절 "
+                    f"{bt['loss_med']:+.1f}%"
+                    + (f" · 손익비 {bt['pf']:.1f}배" if bt["pf"] else "")
+                    + f"\n- 보유 중앙 {bt['hold_med']:.0f}일")
+                st.caption("돌파했을 때를 대비한 참고치입니다. 지금 진입하는 계획이 "
+                           "아니라는 점만 유의하세요.")
+        return
+    if r["days_since"] is not None and r["days_since"] > 60:
+        st.warning(f"돌파한 지 **{r['days_since']}거래일** 지났고 그 사이 "
+                   f"{r['since_ret']:+.1f}% 움직였습니다. 손절선까지 "
+                   f"-{r['risk']:.1f}% 라 초기 진입보다 리스크가 큽니다.")
+    elif r["from_high"] is not None and r["from_high"] <= -10:
+        st.warning(f"돌파 후 고점 대비 **{r['from_high']:.1f}%** 되돌렸습니다. "
+                   "돌파의 힘이 빠진 신호일 수 있어요.")
+    else:
+        st.success(f"200일선 위 {r['gap']:+.1f}% · 손절선까지 -{r['risk']:.1f}%"
+                   + (f" · 돌파 {r['days_since']}일 경과" if r["days_since"] is not None else ""))
+
+    if not bt:
+        st.error("과거 돌파 표본이 없어 통계를 낼 수 없어요.")
+        return
+
+    # ---------------- 과거 통계 ----------------
+    st.markdown("#### 📊 이 종목의 과거 돌파 통계")
+    # 데이터가 깨진 종목에 계획을 만들어주면 안 된다. 경고만 띄우고 표를 그리면
+    # '신뢰하지 마세요' 와 계획이 한 화면에 공존해 모순이 된다.
+    if _bo_suspect(bt, buffer):
+        st.error(
+            f"⚠️ **수정종가 이상이 의심돼 계획을 만들지 않았습니다.**  \n"
+            f"완충 {buffer_pct:.0f}% 로 청산하는 전략인데 중앙 손절이 "
+            f"{bt['loss_med']:+.1f}%, 최악이 {bt['loss_worst']:+.1f}% 입니다. "
+            f"하루 만에 그만큼 빠졌다는 뜻이라 액면분할·배당 조정이 잘못된 것으로 "
+            f"보입니다.  \n"
+            f"(표본 {bt['n']}회 · 승률 {bt['win']:.0f}% · 합산 {bt['total']:+.0f}% — "
+            f"모두 신뢰할 수 없는 값입니다)")
+        return
+    if bt["n"] < min_trades:
+        st.warning(f"**표본이 {bt['n']}회뿐입니다** (설정한 최소 {min_trades}회 미만). "
+                   "아래 승률·손익비는 전략의 성질이 아니라 그 몇 번의 결과일 수 "
+                   "있습니다. 계획은 보여주지만 근거가 약합니다.")
+    s = st.columns(4)
+    s[0].metric("승률", f"{bt['win']:.0f}%", f"돌파 {bt['n']}회", delta_color="off")
+    s[1].metric("중앙 수익", f"{bt['ret_med']:+.1f}%",
+                f"평균 {bt['ret_avg']:+.1f}%", delta_color="off")
+    s[2].metric("손익비", "-" if bt["pf"] is None else f"{bt['pf']:.1f}배",
+                f"익절 {bt['win_med']:+.0f}% / 손절 {bt['loss_med']:+.1f}% (중앙)",
+                delta_color="off")
+    s[3].metric("합산 수익", f"{bt['total']:+.0f}%",
+                f"보유 중앙 {bt['hold_med']:.0f}일", delta_color="off")
+
+    if bt["ret_med"] < 0:
+        msg = (f"**중앙 수익이 {bt['ret_med']:+.1f}% 입니다.** "
+               f"승률 {bt['win']:.0f}% 라 절반 이상이 손실이고, "
+               f"합산 {bt['total']:+.0f}% 는 소수의 큰 승리에서 나옵니다. "
+               "매번 버는 전략이 아닙니다.")
+        share = bt.get("top3_share")
+        # 합산이 음수면 비율 자체가 의미를 잃는다 (실측: LG유플러스 합산 -1577% 에
+        # 상위3건 -10% 라는 해석 불가한 값이 나왔다).
+        if share and bt["total"] > 0:
+            msg += f"  \n가장 큰 승리 3번이 합산수익의 **{share:.0f}%** 를 차지합니다."
+            if share > 100:
+                msg += " 100%를 넘으니 그 3번을 빼면 나머지 합계는 손실입니다."
+        st.warning(msg)
+
+    # ---------------- 시도 예산 ----------------
+    st.markdown("#### 💰 한 번에 얼마를 걸까 (시도 예산)")
+    k = _bo_kelly(bt["win"], bt["pf"])
+    if not k or not k.get("attempts"):
+        st.warning("이 종목의 승률·손익비 조합으로는 켈리 기준이 0 이하입니다. "
+                   "통계적으로 걸 이유가 없다는 뜻이라 시도 금액을 제시하지 않습니다.")
+    else:
+        per = budget * k["half"] if budget else None
+        kc = st.columns(3)
+        kc[0].metric("하프켈리 비중", f"{k['half'] * 100:.1f}%",
+                     f"풀켈리 {k['full'] * 100:.1f}%", delta_color="off")
+        kc[1].metric("권장 시도 횟수", f"{k['attempts']}회",
+                     "예산을 이만큼 쪼갠다", delta_color="off")
+        kc[2].metric("시도당 금액", "-" if per is None else f"{per:,.1f}",
+                     "예산 기준", delta_color="off")
+        if per:
+            rows = []
+            for nfail in (1, 2, 3, 4, 5):
+                lost = per * (r["risk"] / 100.0) * nfail
+                rows.append({
+                    "연속 손절": f"{nfail}회",
+                    "누적 손실": f"{lost:,.1f}",
+                    "예산 대비": f"{lost / budget * 100:+.1f}%" if budget else "-",
+                })
+            st.markdown("**연속으로 틀렸을 때** (시도당 손절 "
+                        f"-{r['risk']:.1f}% 기준)")
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            st.caption(f"· 승률 {bt['win']:.0f}% 면 연속 3회 실패 확률이 "
+                       f"{(1 - bt['win'] / 100) ** 3 * 100:.0f}%, 5회는 "
+                       f"{(1 - bt['win'] / 100) ** 5 * 100:.0f}% 입니다. "
+                       "드문 일이 아니라 정상 범위예요.")
+
+    # ---------------- 피라미딩 계획 ----------------
+    st.markdown("#### 🪜 피라미딩 계획 · 올라갈수록 추가")
+    unit = (budget * k["half"]) if (budget and k and k.get("attempts")) else budget
+    levels = _bo_levels(r["price"], r["stop"], unit)
+    st.dataframe(pd.DataFrame([{
+        "단계": f"{i + 1}단계",
+        "트리거": "지금 진입" if lv["trigger"] == 0 else f"진입가 +{lv['trigger']:.0f}%",
+        "매수 가격": f"{lv['buy']:,.2f}",
+        "비중": f"{lv['weight']:.0f}%",
+        "배분액": "-" if lv["alloc"] is None else f"{lv['alloc']:,.1f}",
+        "누적 투입": f"{lv['cum_weight']:.0f}%",
+        "누적 평단": f"{lv['avg']:,.2f}",
+        "손절선": f"{lv['stop']:,.2f}",
+        "손절 시 손실": f"{lv['loss_pct']:+.1f}%",
+        "손실 금액": "-" if lv["loss_amt"] is None else f"{lv['loss_amt']:,.1f}",
+    } for i, lv in enumerate(levels)]), use_container_width=True, hide_index=True)
+    unit_basis = (f"하프켈리 {k['half'] * 100:.1f}%"
+                  if (k and k.get("attempts")) else "예산 전액")
+    st.caption(
+        "· **비중이 50:30:20 인 이유**: 초기에 크게 넣어야 손절선이 진입가에 가까울 때 "
+        "손실이 작고, 위로 갈수록 작게 넣어야 평단이 덜 올라갑니다.  \n"
+        "· **손절선은 200일선 기준 고정**입니다. 3단계까지 올라가면 손절선이 멀어지므로 "
+        "실전에서는 직전 고점 기준 추적손절로 바꾸는 편이 낫습니다. "
+        "다만 추적손절은 아직 백테스트로 검증하지 않았습니다.  \n"
+        f"· 위 금액은 **한 번의 시도**에 쓰는 돈입니다. 전체 예산이 아니라 "
+        f"{unit_basis} 기준입니다.")
+
+    top3_note = ""
+    if bt.get("top3_share") and bt["total"] > 0:
+        top3_note = f"이 종목은 상위 3건이 합산의 {bt['top3_share']:.0f}% 입니다."
+    with st.expander("⚠️ 이 계획을 믿기 전에 꼭 볼 것", expanded=False):
+        st.markdown(f"""
+- **승률 {bt['win']:.0f}% 는 심리적으로 실행이 매우 어렵습니다.** 통계가 옳아도
+  연속 4~5번 손절에서 대부분 포기합니다. 그 지점이 바로 큰 승리가 나오기 직전일 수
+  있는데, 도구가 이 문제를 해결해주지 못합니다.
+- **합산수익은 소수의 큰 승리에 의존합니다.** {top3_note}
+  중간에 한 번이라도 규칙을 어기고 큰 승리를 놓치면 결과가 완전히 달라집니다.
+- **손절을 지키지 않으면 전략이 성립하지 않습니다.** 42종목 실측에서 돌파가
+  통하지 않은 종목(대한항공 −60%, LG에너지솔루션 −52%)도 있었습니다. 손절이
+  이 손실을 −7% 수준으로 묶어주는 장치입니다.
+- **피라미딩 트리거(+7%/+15%)와 비중(50:30:20)은 아직 백테스트하지 않았습니다.**
+  위 과거 통계는 '돌파 시 1회 진입'을 가정한 숫자입니다. 분할 진입하면 평단이
+  올라가서 실제 성과는 달라집니다. 이 부분은 근거가 약하니 참고로만 쓰세요.
+- **생존자 편향이 있습니다.** 종목 목록이 현재 시총 상위라 과거에 밀려나거나
+  상장폐지된 종목이 표본에 없습니다. 실제보다 낙관적으로 나옵니다.
+- **완충 {buffer_pct:.0f}% 기준입니다.** 완충을 바꾸면 승률·거래횟수가 크게 바뀌지만
+  총수익은 비슷합니다. 42종목 실측에서 0% → 승률 15.5%·64회, 5% → 27.8%·21회인데
+  합산 중앙값은 +172% vs +165% 였습니다.
+- 과거 통계이고 투자 권유가 아닙니다.
+        """)
+    st.caption(f"· 가격 기준일 {r['asof']} · 200일선 {r['ma200']:,.2f} · "
+               f"완충 {buffer_pct:.0f}% (손절선 {r['stop']:,.2f})  \n"
+               f"· 사전계산 없이 **이번 조회 시점에 전체 기간을 실시간 계산**했습니다 "
+               f"({r['history_start']} 부터, 돌파 {bt['n']}회). 결과는 30분간 캐시됩니다.")
+
+
 # --- 사이드바: 리소스 관리 ---
 with st.sidebar:
     st.markdown("### ⚙️ 설정")
@@ -3981,11 +4726,14 @@ group1, group2, group3, group4 = st.tabs([
 ])
 
 with group1:
-    sub = st.tabs(["🎯 위치별 승률 스크리너", "📐 적립 계획", "🪙 크립토 200일선+MVRV"])
+    sub = st.tabs(["🎯 위치별 승률 스크리너", "📐 적립 계획", "🚀 돌파 계획",
+                   "🪙 크립토 200일선+MVRV"])
     tab1 = sub[0]
     with sub[1]:
         render_accum_plan()
     with sub[2]:
+        render_breakout()
+    with sub[3]:
         render_crypto_screener()
 
 with group2:
