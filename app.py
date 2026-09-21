@@ -3113,6 +3113,40 @@ def _accum_rank(cands):
     return cands
 
 
+# 적립·돌파 스캔의 자산군 필터. None 은 전체.
+# 코인을 따로 볼 수 있어야 하는 이유: 코인은 재무제표가 없어 재무건전성 배점에서
+# 일괄 0.5(절반)를 받는다. 주식과 섞어 순위를 내면 그만큼 불리하게 깔린다.
+# 코인끼리만 비교하면 모두 같은 값이라 왜곡이 사라진다.
+_ACCUM_MARKETS = {
+    "전체": None,
+    "🇺🇸🇰🇷 주식만": {"US", "KR"},
+    "🇺🇸 미국 주식": {"US"},
+    "🇰🇷 한국 주식": {"KR"},
+    "🪙 코인만": {"ALT"},
+    "💱📊 환율·국채·지수": {"FXB", "IDX"},
+}
+
+# 사전계산(accum_data.json) 실측으로 확인한 코인의 적립 특성.
+# 규칙에 따라 성질이 완전히 달라서, 코인을 주식과 같은 눈으로 보면 안 된다.
+#   200일선 복귀:  승률중앙 86.7% · 수익중앙 +11.0% · 투입률 50%
+#                 (주식 US 94.6%/+8.5% 보다 승률은 낮은데 수익은 높고 보유가 짧다)
+#   3개월 보유:    승률중앙 55.0% · 수익중앙  +2.4% · 투입률 100% · DD -11.8%
+#   12개월 보유:   승률중앙 50.0% · 수익중앙  +4.1% · 투입률 100% · DD -24.2%
+_ACCUM_COIN_NOTE = (
+    "🪙 **코인이 순위에 있습니다. 주식과 성질이 다릅니다.**  \n"
+    "· **200일선 복귀 규칙에서는 코인이 강합니다.** 사전계산 실측으로 코인 9종목의 "
+    "승률 중앙 86.7% · 수익 중앙 **+11.0%** 이고, 주식(미국 94.6% / +8.5%)보다 "
+    "승률은 낮지만 수익이 높고 보유가 짧습니다 (LINK 13일, BNB 12일).  \n"
+    "· **기간 보유 규칙에서는 약합니다.** 3개월 보유는 승률 55.0% · 수익 +2.4%, "
+    "12개월 보유는 승률 50.0% 에 미실현 손실 중앙 **-24.2%** 입니다. "
+    "ADA 는 12개월 보유에서 수익 중앙 -16.5%, 하위 25% 가 **-51.4%** 였습니다.  \n"
+    "· **투입률이 주식보다 훨씬 높습니다** (코인 100% vs 주식 42~50%). 변동성이 커서 "
+    "사다리 끝까지 내려가는 경우가 많다는 뜻이고, 예산이 전부 들어갑니다.  \n"
+    "· **재무건전성 점수를 못 받습니다.** 코인은 재무제표가 없어 5점 중 절반(2.5점)으로 "
+    "고정됩니다. 주식과 섞어 순위를 보면 그만큼 불리하게 깔리니, 코인끼리 비교하려면 "
+    "자산군을 **🪙 코인만** 으로 바꾸세요.")
+
+
 def _render_accum_scan():
     """200일선 아래 종목을 종합점수로 순위 매겨 적립 후보를 뽑는다.
 
@@ -3150,16 +3184,40 @@ def _render_accum_scan():
         # 밀린 종목(예: 괴리 -8% 의 TSLA, 13위)이 아예 안 보인다.
         topn = int(c4.number_input("표시 개수", 5, 50, 20, 5, key="as_topn"))
 
-        c5, c6 = st.columns(2)
+        c5, c6, c7 = st.columns([1, 1.1, 1.5])
         min_eps = int(c5.number_input("최소 에피소드", 0, 100, 10, 5, key="as_eps",
                                      help="백테스트 표본이 이보다 적은 종목은 제외합니다."))
-        health_only = c6.checkbox("재무건전성 좋은 종목만 (🟢 건전)", value=False, key="as_health")
+        mkt_label = c6.selectbox(
+            "자산군", list(_ACCUM_MARKETS), index=0, key="as_mkt",
+            help="코인은 재무제표가 없어 재무건전성 지표가 없습니다. "
+                 "주식과 섞어 보면 재무 배점에서 불리하니, 코인만 따로 보는 편이 "
+                 "비교가 정확합니다.")
+        allowed = _ACCUM_MARKETS[mkt_label]
+        # 재무건전성은 recovery_data.json 에서 읽는데 여기엔 US/KR 만 있다.
+        # 코인·환율·지수를 고른 상태에서 이 필터를 켜면 결과가 0건이 되므로 잠근다.
+        can_health = (allowed is None) or bool(allowed & {"US", "KR"})
+        health_only = c7.checkbox(
+            "재무건전성 좋은 종목만 (🟢 건전)", value=False, key="as_health",
+            disabled=not can_health,
+            help=("재무 데이터가 있는 미국·한국 주식에만 쓸 수 있어요. "
+                  "코인·환율·지수는 재무제표가 없습니다." if not can_health else None))
+        health_only = bool(health_only) and can_health
+
+        # 코인은 청산 규칙에 따라 성질이 정반대라, 스캔 전에 알려주는 편이 낫다.
+        # 기본 규칙(3개월 보유)으로 코인을 보면 주식에 밀려 순위에 아예 안 나온다.
+        if allowed == {"ALT"} and not rule.startswith("sma"):
+            st.caption("🪙 코인은 **'200일선 복귀 시 매도'** 규칙에서 가장 강합니다 "
+                       "(9종목 승률 중앙 86.7% · 수익 중앙 +11.0% · 투입률 50%). "
+                       f"지금 고른 '{rl[rule]}' 규칙에서는 승률 55% · 수익 +2.4% 로 "
+                       "주식보다 약해서 순위에 잘 안 나옵니다.")
 
         if st.button("🔍 후보 스캔", type="primary", key="as_go"):
             key = f"{rule}|{scheme}"
             # 사다리에서 가장 얕은(먼저 닿는) 구간. levels 가 음수라 max 가 -5% 다.
             first_lv = max(ACCUM_META.get("levels") or [-5.0])
-            targets = [(tk, v) for tk, v in ACCUM_DATA.items() if key in (v.get("combos") or {})]
+            targets = [(tk, v) for tk, v in ACCUM_DATA.items()
+                       if key in (v.get("combos") or {})
+                       and (allowed is None or v.get("market") in allowed)]
             rows, prog = [], st.progress(0.0)
             for i, (tk, v) in enumerate(targets):
                 prog.progress((i + 1) / max(1, len(targets)))
@@ -3194,7 +3252,8 @@ def _render_accum_scan():
                 })
             prog.empty()
             st.session_state["as_rows"] = _accum_rank(rows)
-            st.session_state["as_desc"] = f"{rl[rule]} · {sl[scheme]} · {pos}"
+            st.session_state["as_desc"] = f"{rl[rule]} · {sl[scheme]} · {pos} · {mkt_label}"
+            st.session_state["as_mkt_used"] = mkt_label
 
         rows = st.session_state.get("as_rows")
         if rows is None:
@@ -3202,11 +3261,44 @@ def _render_accum_scan():
                        "조회하므로 20~40초 걸립니다.")
             return
         if not rows:
-            st.warning("조건에 맞는 종목이 없어요. 최소 에피소드나 재무 필터를 완화해 보세요.")
+            used = st.session_state.get("as_mkt_used", mkt_label)
+            hints = [f"**현재 위치** 조건이 '{pos}' 입니다. 지금 그 구간에 있는 종목이 "
+                     "없을 수 있어요. '전체'로 바꿔 보세요."]
+            if used == "🪙 코인만":
+                hints.append("코인은 9종목뿐이라 조건이 겹치기 어렵습니다. "
+                             "지금은 대부분 200일선 **위**에 있어 '첫 구간 도달'에 "
+                             "걸리지 않습니다. 200일선 위 종목을 모으는 계획은 "
+                             "**🚀 돌파 계획** 탭이 맞습니다.")
+            hints.append("최소 에피소드를 낮추거나 자산군을 넓히는 방법도 있습니다.")
+            st.warning(f"'{used}' 에서 조건에 맞는 종목이 없어요.  \n"
+                       + "  \n".join(f"· {h}" for h in hints))
             return
 
         st.success(f"🏆 **{len(rows)}종목** 중 상위 {min(topn, len(rows))}개 "
                    f"({st.session_state.get('as_desc', '')})")
+        n_coin_top = sum(1 for r in rows[:topn] if r.get("시장") == "🪙")
+        coins_all = [r for r in rows if r.get("시장") == "🪙"]
+        if n_coin_top:
+            st.info(_ACCUM_COIN_NOTE)
+        elif coins_all:
+            # 코인이 후보엔 있는데 상위권에 못 든 이유를 밝혀준다. 대개 지금
+            # 200일선 위에 있어서 '현재위치' 15점을 0점 받기 때문이다.
+            above = [c for c in coins_all if c.get("_gap", 0) >= 0]
+            best = max(coins_all, key=lambda c: c.get("_score", 0))
+            why = ""
+            if above:
+                gaps = sorted(c["_gap"] for c in above)
+                why = (f" 코인 {len(above)}종목이 지금 200일선 **위**"
+                       f"({gaps[0]:+.1f}% ~ {gaps[-1]:+.1f}%)라 "
+                       f"**현재위치 15점을 0점** 받습니다. 적립은 200일선 아래에서 "
+                       f"모으는 전략이라서요. 200일선 위 종목을 모으는 계획은 "
+                       f"**🚀 돌파 계획** 탭이 맞습니다.")
+            st.caption(f"🪙 코인 {len(coins_all)}종목이 후보에 있지만 상위 "
+                       f"{min(topn, len(rows))}위 안에는 없습니다 "
+                       f"(최고 {best['종목']} {best['_score']}점).{why}  \n"
+                       f"코인끼리만 비교하려면 자산군을 **🪙 코인만** 으로 바꾸세요. "
+                       f"코인은 재무제표가 없어 재무건전성 5점 중 절반으로 고정되는 "
+                       f"불이익도 함께 사라집니다.")
         show = [c for c in rows[0] if not c.startswith("_")]
         table = pd.DataFrame([
             {"순위": i + 1, "점수": r["_score"], "등급": _score_grade(r["_score"], r["_n"] < 20),
@@ -3976,10 +4068,25 @@ def render_insider():
 # 티커를 한 번에 묶어 보내면 15배 빨라진다. 병목은 계산이 아니라 다운로드였다.
 
 _BO_MIN_TRADES = 10          # 이보다 표본이 적으면 통계로 보지 않는다
-_BO_STOCK_MARKETS = ("US", "KR")
 _BO_WEIGHTS = (50.0, 30.0, 20.0)      # 역피라미드: 초기에 크게
 _BO_TRIGGERS = (0.0, 7.0, 15.0)       # 진입가 대비 추가매수 시점(%)
 _BO_MKT_EMOJI = {"US": "🇺🇸", "KR": "🇰🇷", "ALT": "🪙", "FXB": "💱", "IDX": "📊"}
+
+# 실측으로 확인한 코인의 돌파 특성 (완충 5%, 전체 기간).
+# 합산수익은 압도적인데 손절선까지 거리가 멀어 한 번의 실패 비용이 크다.
+_BO_COIN_NOTE = (
+    "🪙 **코인이 순위에 있습니다. 돌파에서 주식과 다른 점이 있습니다.**  \n"
+    "· **추세추종이 코인에 가장 잘 먹혔습니다.** 실측 합산수익이 DOGE +5781%, "
+    "SOL +5661%, BTC +3184%, ADA +2479% 입니다. 주식 상위권(KLA +1355%, "
+    "Disney +930%)보다 한 자리 큽니다.  \n"
+    "· **그런데 한 번 틀릴 때 비용이 2~5배입니다.** 코인은 200일선에서 멀어진 상태로 "
+    "사게 되어 손절까지 거리가 BTC -29.2%, DOGE -18.9% 였습니다. 주식은 보통 "
+    "-5~12% 입니다. 같은 금액을 넣으면 손실 금액이 그만큼 커집니다.  \n"
+    "· **그래서 '손절 근접' 점수가 낮게 나옵니다.** 벌점이 아니라 실제 리스크를 "
+    "반영한 값입니다. 코인끼리만 비교하려면 자산군을 **🪙 코인만** 으로 바꾸세요.  \n"
+    "· **중앙 수익은 코인도 음수입니다** (BTC -5.8%). 승률 44% 에 합산 +3184% 지만 "
+    "큰 승리 3번이 합산의 99% 를 차지합니다.  \n"
+    "· 코인은 9종목뿐이라 동시에 돌파 상태인 경우가 드뭅니다.")
 
 
 def _bo_cols(raw, field):
@@ -4323,11 +4430,14 @@ def _bo_render_scan(recent_days, buffer, min_trades):
         if not WINZONE_DATA:
             st.warning("종목 목록(winzone_data.json)이 없어 스캔할 수 없어요.")
             return
-        c1, c2 = st.columns(2)
-        include_coin = c1.checkbox(
-            "코인·환율·지수 포함", value=False, key="bo_coin",
+        c1, c2 = st.columns([1.5, 1])
+        mkt_label = c1.selectbox(
+            "자산군", list(_ACCUM_MARKETS), index=1, key="bo_mkt",
             help="코인은 변동성이 커서 200일선에서 멀어진 상태로 사게 됩니다. "
-                 "손절까지 거리가 멀어 리스크가 큽니다. 기본은 주식만 봅니다.")
+                 "손절까지 거리가 멀어 '손절 근접' 점수가 낮게 나오는데, 이건 "
+                 "벌점이 아니라 실제 리스크입니다. 코인끼리 비교하려면 "
+                 "'🪙 코인만' 을 고르세요.")
+        allowed = _ACCUM_MARKETS[mkt_label]
         topn = int(c2.number_input("표시 개수", 5, 50, 15, 5, key="bo_topn"))
 
         if st.button("🔍 돌파 스캔", type="primary", key="bo_go"):
@@ -4352,15 +4462,19 @@ def _bo_render_scan(recent_days, buffer, min_trades):
 
         pool = [dict(c) for c in cands
                 if not c.get("skip")
-                and (include_coin or c.get("market") in _BO_STOCK_MARKETS)]
+                and (allowed is None or c.get("market") in allowed)]
         if not pool:
-            st.warning("조건을 통과한 종목이 없어요. 최소 표본을 낮추거나 "
-                       "코인 포함을 켜보세요.")
+            st.warning(f"'{mkt_label}' 에서 조건을 통과한 종목이 없어요. "
+                       "자산군을 넓히거나 최소 표본을 낮춰 보세요. "
+                       "(코인은 9종목뿐이라 동시에 돌파 상태인 경우가 드뭅니다)")
         else:
             pool = _bo_rank(pool, recent_days)
-            st.success(f"🚀 후보 {meta.get('candidates', 0)}종목 중 조건 통과 "
-                       f"**{len(pool)}종목** · 상위 {min(topn, len(pool))}개 "
+            st.success(f"🚀 후보 {meta.get('candidates', 0)}종목 중 "
+                       f"'{mkt_label}' 조건 통과 **{len(pool)}종목** · "
+                       f"상위 {min(topn, len(pool))}개 "
                        f"(기준일 {meta.get('asof', '-')})")
+            if any(r.get("market") == "ALT" for r in pool[:topn]):
+                st.info(_BO_COIN_NOTE)
             st.dataframe(pd.DataFrame([{
                 "순위": i + 1,
                 "점수": r["score"],
