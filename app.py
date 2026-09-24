@@ -3320,7 +3320,10 @@ def _render_accum_scan():
         pick = p1.selectbox("이 중에서 상세 계획 보기",
                             [f"{r['종목']} ({r['티커']})" for r in rows[:topn]], key="as_pick")
         if p2.button("📐 이 종목으로 계획 만들기", key="as_apply"):
-            st.session_state["ap_q"] = pick[pick.rfind("(") + 1:-1]
+            _tk = pick[pick.rfind("(") + 1:-1]
+            # ap_shown 까지 넣어야 rerun 후 바로 계획이 뜬다.
+            st.session_state["ap_q"] = _tk
+            st.session_state["ap_shown"] = _tk
             st.rerun()
 
         with st.expander("🧮 점수는 어떻게 계산되나 (총 100점)", expanded=False):
@@ -3368,6 +3371,12 @@ def render_accum_plan():
 
     c1, c2 = st.columns([2, 1])
     with c1:
+        # 뒤에 렌더되는 탭(공시 뻐꾸기통)에서 넘긴 종목을 위젯 생성 전에 꺼낸다.
+        # 위젯이 만들어진 뒤에는 ap_q 를 대입할 수 없다.
+        _pending = st.session_state.pop("ap_pending", None)
+        if _pending:
+            st.session_state["ap_q"] = _pending
+            st.session_state["ap_shown"] = _pending
         # 기본값을 value= 로 주면 스캔 결과에서 session_state 로 채울 때 경고가 난다.
         # session_state 를 단일 소스로 두는 게 Streamlit 권장 패턴이다.
         st.session_state.setdefault("ap_q", "AAPL")
@@ -3389,10 +3398,22 @@ def render_accum_plan():
         scheme = st.selectbox("비중 방식", list(scheme_label.keys()),
                               format_func=lambda k: scheme_label[k], index=0, key="ap_scheme")
 
-    if not st.button("📐 계획 만들기", type="primary", key="ap_go"):
+    # 버튼은 눌린 그 실행에서만 True 다. 이 값만 보고 계획을 그리면 위쪽
+    # '적립 후보 찾기' 의 표시 개수·자산군을 건드릴 때마다 아래 계획이 사라진다.
+    # 무엇을 보여주는 중인지 session_state 에 남겨 재실행에서도 유지한다.
+    if st.button("📐 계획 만들기", type="primary", key="ap_go"):
+        st.session_state["ap_shown"] = (query or "").strip()
+
+    shown = (st.session_state.get("ap_shown") or "").strip()
+    if not shown:
         st.info("종목을 입력하고 버튼을 누르세요. 사전계산 목록에 없는 종목도 조회됩니다. "
                 "(전체 기간을 실시간 계산하며 보통 1~3초)")
         return
+
+    if shown != (query or "").strip():
+        st.caption(f"· 아래 계획은 **{shown}** 기준입니다. "
+                   f"`{query}` 로 바꾸려면 **📐 계획 만들기** 를 다시 눌러주세요.")
+    query = shown
 
     res = _accum_resolve(query)
     if res["status"] == "candidates":
@@ -3846,7 +3867,12 @@ def _jump_to_plan(label, tickers, key):
     c1, c2 = st.columns([2, 1])
     pick = c1.selectbox(label, tickers, key=f"{key}_pick")
     if c2.button("📐 적립 계획 보기", key=f"{key}_go"):
-        st.session_state["ap_q"] = pick.split(" ")[0]
+        # ap_q 를 직접 대입하면 안 된다. 적립 계획(group1)이 이 탭(group2)보다
+        # 먼저 렌더되므로 이 시점엔 ap_q 위젯이 이미 만들어져 있고, Streamlit 은
+        # "cannot be modified after the widget is instantiated" 예외를 던진다.
+        # 위젯이 아닌 별도 키에 담아 두면 다음 실행에서 render_accum_plan 이
+        # 위젯 생성 전에 꺼내 쓴다.
+        st.session_state["ap_pending"] = pick.split(" ")[0]
         st.rerun()
 
 
@@ -4516,7 +4542,11 @@ def _bo_render_scan(recent_days, buffer, min_trades):
                                 [f"{r['name']} ({r['ticker']})" for r in pool[:topn]],
                                 key="bo_pick")
             if p2.button("🚀 이 종목으로 계획 만들기", key="bo_apply"):
-                st.session_state["bo_q"] = pick[pick.rfind("(") + 1:-1]
+                _tk = pick[pick.rfind("(") + 1:-1]
+                # bo_shown 까지 같이 넣어야 rerun 후 바로 계획이 뜬다.
+                # 이걸 빼면 아래에서 '계획 만들기' 를 한 번 더 눌러야 한다.
+                st.session_state["bo_q"] = _tk
+                st.session_state["bo_shown"] = _tk
                 st.rerun()
 
         ex = meta.get("excluded") or []
@@ -4594,10 +4624,24 @@ def render_breakout():
                                  key="bo_bud",
                                  help="단위는 자유롭게 쓰세요(만원·달러 등).")
 
-    if not st.button("🚀 계획 만들기", type="primary", key="bo_plan"):
+    # 버튼은 눌린 그 실행에서만 True 다. 이 값만 보고 계획을 그리면,
+    # 표시 개수·자산군처럼 관계없는 위젯을 건드려 재실행이 걸릴 때마다 계획이
+    # 통째로 사라진다. 그래서 '무엇을 보여주는 중인지' 를 session_state 에 남긴다.
+    if st.button("🚀 계획 만들기", type="primary", key="bo_plan"):
+        st.session_state["bo_shown"] = (query or "").strip()
+
+    shown = (st.session_state.get("bo_shown") or "").strip()
+    if not shown:
         st.info("종목을 입력하고 버튼을 누르세요. 사전계산 목록에 없는 종목도 조회됩니다. "
                 "(전체 기간을 실시간 계산하며 보통 1초)")
         return
+
+    # 입력창만 바꾸고 버튼을 안 눌렀을 때 무엇을 보여주는 중인지 밝힌다.
+    # 타이핑 중간값으로 조회가 돌지 않게 종목 변경은 버튼을 다시 눌러야 반영한다.
+    if shown != (query or "").strip():
+        st.caption(f"· 아래 계획은 **{shown}** 기준입니다. "
+                   f"`{query}` 로 바꾸려면 **🚀 계획 만들기** 를 다시 눌러주세요.")
+    query = shown
 
     res = _accum_resolve(query)
     if res["status"] == "candidates":
